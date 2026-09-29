@@ -92,6 +92,141 @@ export function toFullUsage(u: UsageLike): FullUsage {
  * Throws a message naming what was actually received, so a malformed payload
  * fails locally with something actionable instead of reaching the Jev API.
  */
+/** Limits published in the Jev API reference - enforced here so a caller gets a
+ *  precise local error instead of a 422 from the server. */
+const QUESTION_TYPES = ["choice", "score", "noul"] as const;
+const MAX_QUESTIONS = 8;
+const MAX_QUESTION_NAME = 64;
+const MAX_INSTRUCTIONS = 1800;
+const MIN_OPTIONS = 2;
+const MAX_OPTIONS = 20;
+const MIN_LEVELS = 2;
+const MAX_LEVELS = 10;
+const MAX_CRITERIA_SERIALIZED = 2000;
+
+function kindOf(v: unknown): string {
+	if (v === null) return "null";
+	if (Array.isArray(v)) return "an array";
+	return typeof v;
+}
+
+/**
+ * Validate a normalized questions map and return one precise, single-cause
+ * problem per line.
+ *
+ * This exists because the JSON-schema union errors are unreadable: a wrong
+ * `criteria` shape produced five lines, four of which blamed `type` with
+ * "must be equal to constant" and none of which said how to fix it. The
+ * consuming model reads this message and retries, so it must name the field
+ * and the correction.
+ */
+export function explainQuestionProblems(input: unknown): string[] {
+	const problems: string[] = [];
+	if (typeof input !== "object" || input === null || Array.isArray(input)) {
+		return [
+			`questions must be an object mapping a short key to each question, got ${kindOf(input)}`,
+		];
+	}
+
+	const entries = Object.entries(input as Record<string, unknown>);
+	if (entries.length === 0) problems.push("questions must contain at least 1 question");
+	if (entries.length > MAX_QUESTIONS) {
+		problems.push(`questions: at most ${MAX_QUESTIONS} per request, got ${entries.length}`);
+	}
+
+	for (const [key, raw] of entries) {
+		const where = `questions["${key}"]`;
+		if (key.length > MAX_QUESTION_NAME) {
+			problems.push(
+				`question name "${key.slice(0, 12)}...": at most ${MAX_QUESTION_NAME} characters, got ${key.length}`
+			);
+		}
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+			problems.push(`${where} must be an object, got ${kindOf(raw)}`);
+			continue;
+		}
+
+		const { type, instructions, criteria } = raw as {
+			type?: unknown;
+			instructions?: unknown;
+			criteria?: unknown;
+		};
+
+		if (typeof type !== "string" || !(QUESTION_TYPES as readonly string[]).includes(type)) {
+			problems.push(
+				`${where}.type must be one of ${QUESTION_TYPES.join(", ")}, got ${JSON.stringify(type ?? null)}`
+			);
+			continue;
+		}
+
+		if (typeof instructions !== "string" || instructions.trim() === "") {
+			problems.push(`${where}.instructions must be a non-empty string`);
+		} else if (instructions.length > MAX_INSTRUCTIONS) {
+			problems.push(
+				`${where}.instructions: at most ${MAX_INSTRUCTIONS} characters, got ${instructions.length}`
+			);
+		}
+
+		if (criteria === undefined) {
+			if (type === "choice") {
+				problems.push(
+					`${where}.criteria is required for a choice: an object of ${MIN_OPTIONS}-${MAX_OPTIONS} option keys`
+				);
+			} else if (type === "score") {
+				problems.push(
+					`${where}.criteria is required for a score: an array of ${MIN_LEVELS}-${MAX_LEVELS} ordered levels`
+				);
+			}
+			continue;
+		}
+
+		if (type === "choice") {
+			if (criteria === null || typeof criteria !== "object" || Array.isArray(criteria)) {
+				problems.push(
+					`${where}.criteria must be an object mapping option key -> description, got ${kindOf(criteria)}`
+				);
+				continue;
+			}
+			const n = Object.keys(criteria).length;
+			if (n < MIN_OPTIONS || n > MAX_OPTIONS) {
+				problems.push(`${where}.criteria: ${MIN_OPTIONS}-${MAX_OPTIONS} option keys, got ${n}`);
+			}
+		} else if (type === "score") {
+			if (!Array.isArray(criteria)) {
+				problems.push(
+					`${where}.criteria must be an array of ordered level labels, got ${kindOf(criteria)}`
+				);
+				continue;
+			}
+			if (criteria.length < MIN_LEVELS || criteria.length > MAX_LEVELS) {
+				problems.push(`${where}.criteria: ${MIN_LEVELS}-${MAX_LEVELS} levels, got ${criteria.length}`);
+			}
+		} else {
+			// noul: criteria is optional, and when present it must be a MAP.
+			if (Array.isArray(criteria)) {
+				problems.push(
+					`${where}.criteria must be a map like {"yes": "affirmative"} - the Jev API rejects an array with 422`
+				);
+				continue;
+			}
+			if (criteria === null || typeof criteria !== "object") {
+				problems.push(
+					`${where}.criteria must be a map of label -> description, got ${kindOf(criteria)}`
+				);
+				continue;
+			}
+		}
+
+		const serialized = JSON.stringify(criteria);
+		if (serialized !== undefined && serialized.length > MAX_CRITERIA_SERIALIZED) {
+			problems.push(
+				`${where}.criteria: at most ${MAX_CRITERIA_SERIALIZED} characters serialized, got ${serialized.length}`
+			);
+		}
+	}
+	return problems;
+}
+
 /**
  * Max unbalanced trailing closers we will trim. One or two is a serialization
  * slip; more is structurally different input, so reject rather than guess.

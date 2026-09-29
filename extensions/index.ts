@@ -24,6 +24,7 @@ import {
 	buildToolResult,
 	CircuitBreaker,
 	coerceQuestions,
+	explainQuestionProblems,
 	runJevDecide,
 	type DecideParams,
 	type FallbackResult,
@@ -36,46 +37,33 @@ const JEV_URL = "https://jevmodel.org/v1/systemone";
 /** Shared across calls in a session so the preflight sees prior failures. */
 const circuit = new CircuitBreaker();
 
-const questionSchema = Type.Union(
-	[
-		Type.Object({
-			type: Type.Literal("choice", {
-				description: "Pick one option from a set (returns choice, probabilities, confidence)",
-			}),
-			instructions: Type.String({ description: "What to decide, up to 1800 chars" }),
-			criteria: Type.Record(
-				Type.String(),
-				Type.String({ description: "Option key -> description" }),
-				{ description: "2-20 option keys mapped to descriptions" }
-			),
-		}),
-		Type.Object({
-			type: Type.Literal("score", {
-				description: "Rate on an ordered scale (returns numeric score, confidence)",
-			}),
-			instructions: Type.String({ description: "What to rate, up to 1800 chars" }),
-			criteria: Type.Array(Type.String(), {
-				description: "2-10 ordered levels, e.g. [routine, soon, urgent, critical]",
-				minItems: 2,
-				maxItems: 10,
-			}),
-		}),
-		Type.Object({
-			type: Type.Literal("noul", {
-				description: "Yes/no question (returns noul = probability of yes, 0..1)",
-			}),
-			instructions: Type.String({ description: "The yes/no question, up to 1800 chars" }),
-			criteria: Type.Optional(
-				Type.Record(Type.String(), Type.String(), {
-					description:
-						"Optional label descriptions as a map, e.g. {\"yes\": \"affirmative\", \"no\": \"negative\"}. " +
-						"Must be an object - the API rejects an array with 422.",
-				})
-			),
-		}),
-	],
-	{ description: "Question type: choice, score, or noul" }
-);
+/**
+ * Deliberately loose.
+ *
+ * Discriminating choice/score/noul inside the schema made errors unreadable:
+ * a wrong `criteria` shape produced five union lines, four of them blaming
+ * `type` with "must be equal to constant", and none saying how to fix it.
+ * pi validates against this schema *before* execute() runs, so a strict union
+ * meant the readable error could never be produced. The schema now checks only
+ * what it must; explainQuestionProblems() validates the rest and names the
+ * field plus the correction - which is what the consuming model reads on retry.
+ */
+const questionShape = Type.Object({
+	type: Type.String({
+		description:
+			"Which answer you want: \"choice\" (pick one label), \"score\" (position on a 2-10 level scale), " +
+			"or \"noul\" (yes/no probability in 0..1)",
+	}),
+	instructions: Type.String({ description: "What to decide or rate, up to 1800 chars" }),
+	criteria: Type.Optional(
+		Type.Any({
+			description:
+				"choice: object of 2-20 option keys -> descriptions. " +
+				"score: array of 2-10 ordered level labels, e.g. [routine, urgent, critical]. " +
+				"noul: optional map of label -> description (a map, never an array - an array is rejected by the API with 422)",
+		})
+	),
+});
 
 /**
  * Canonical wire shape of the `questions` argument.
@@ -84,7 +72,7 @@ const questionSchema = Type.Union(
  * string as well (see below), and the string branch bypasses schema validation
  * of its *contents* - `execute()` re-checks against this record after coercion.
  */
-const questionRecord = Type.Record(Type.String({ maxLength: 64 }), questionSchema, {
+const questionRecord = Type.Record(Type.String({ maxLength: 64 }), questionShape, {
 	description: "1-8 questions keyed by short identifier names (letters, digits, _)",
 });
 
@@ -96,6 +84,13 @@ const questionRecord = Type.Record(Type.String({ maxLength: 64 }), questionSchem
  */
 export function normalizeQuestions(input: unknown): Questions {
 	const questions = coerceQuestions(input);
+	// Precise validation first: the schema is deliberately loose (see questionShape),
+	// so this is where a wrong shape gets named - field by field, one cause per line.
+	const problems = explainQuestionProblems(questions);
+	if (problems.length > 0) {
+		throw new Error(`Invalid questions:\n  - ${problems.join("\n  - ")}`);
+	}
+	// Backstop for whatever the schema still enforces (name length, string types).
 	validateToolArguments(
 		{
 			name: "jev_decide",

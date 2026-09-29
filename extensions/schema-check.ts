@@ -82,18 +82,35 @@ const main = async () => {
 	assert(!(await acceptsSchema([1, 2])), "schema rejects an array");
 
 	// noul.criteria is a MAP. Verified against the live API: an array returns 422,
-	// a dict returns 200 - so the schema must refuse the array locally rather than
-	// let the caller hit a hard API error (422 is a surfaced error, not a fallback).
+	// a dict returns 200. The schema is deliberately loose so pi passes the payload
+	// through; the combined barrier (schema + explainQuestionProblems) is what must
+	// hold - and 422 is a surfaced error, not a fallback.
 	assert(
-		await acceptsSchema({
+		await reachesJev({
 			q: { type: "noul", instructions: "x", criteria: { yes: "affirmative", no: "negative" } },
 		}),
-		"noul with a criteria MAP is accepted"
+		"noul with a criteria MAP reaches Jev"
 	);
 	assert(
-		!(await acceptsSchema({ q: { type: "noul", instructions: "x", criteria: ["yes", "no"] } })),
-		"noul with a criteria ARRAY is rejected locally (the API would 422)"
+		!(await reachesJev({ q: { type: "noul", instructions: "x", criteria: ["yes", "no"] } })),
+		"noul with a criteria ARRAY is rejected before any request (the API would 422)"
 	);
+
+	// The message the consuming model reads must name the field and the fix.
+	try {
+		normalizeQuestions({ q: { type: "noul", instructions: "x", criteria: ["yes", "no"] } });
+		assert(false, "noul + array should have thrown a readable error");
+	} catch (e) {
+		const message = e instanceof Error ? e.message : String(e);
+		assert(
+			message.includes('questions["q"].criteria') && message.includes("422"),
+			`error names the field and the cause (got: ${message.split("\n").slice(0, 2).join(" | ")})`
+		);
+		assert(
+			!message.includes("must be equal to constant"),
+			"error no longer contains the union red herring"
+		);
+	}
 	// Note: pi's validator normalizes `null` in a way that lets it past the schema,
 	// so the schema alone is not the barrier for null - coerceQuestions() is.
 	// The `bad` list below asserts the combined invariant, which is what matters.

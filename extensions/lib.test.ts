@@ -6,6 +6,7 @@ import {
 	buildToolResult,
 	CircuitBreaker,
 	coerceQuestions,
+	explainQuestionProblems,
 	extractJsonObject,
 	isCapacityFailure,
 	normalizeAnswers,
@@ -912,5 +913,103 @@ describe("validateJevAnswers", () => {
 		await expect(runJevDecide(params, deps({ fetchImpl: bad }))).rejects.toThrow(
 			/invalid choice/
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// precise, single-cause validation errors (and the documented API limits)
+// ---------------------------------------------------------------------------
+
+describe("explainQuestionProblems", () => {
+	const q = (over: Record<string, unknown>) => ({ q: { type: "noul", instructions: "x", ...over } });
+
+	test("a valid question set reports no problems", () => {
+		expect(explainQuestionProblems({ ok: { type: "noul", instructions: "yes/no?" } })).toEqual([]);
+		expect(
+			explainQuestionProblems({
+				a: { type: "choice", instructions: "pick", criteria: { x: "first", y: "second" } },
+				b: { type: "score", instructions: "rate", criteria: ["low", "high"] },
+				c: { type: "noul", instructions: "is it?" },
+			})
+		).toEqual([]);
+	});
+
+	test("noul + array criteria names the field and the fix, not the union", () => {
+		const problems = explainQuestionProblems(q({ criteria: ["yes", "no"] }));
+		expect(problems).toHaveLength(1);
+		expect(problems[0]).toContain('questions["q"].criteria');
+		expect(problems[0]).toContain("map");
+		expect(problems[0]).toContain("422");
+	});
+
+	test("choice criteria must be an object, not an array", () => {
+		const problems = explainQuestionProblems({
+			q: { type: "choice", instructions: "x", criteria: ["a", "b"] },
+		});
+		expect(problems).toHaveLength(1);
+		expect(problems[0]).toContain('questions["q"].criteria');
+		expect(problems[0]).toContain("object");
+	});
+
+	test("score criteria must be an array, not a map", () => {
+		const problems = explainQuestionProblems({
+			q: { type: "score", instructions: "x", criteria: { a: "A" } },
+		});
+		expect(problems).toHaveLength(1);
+		expect(problems[0]).toContain("array");
+	});
+
+	test("an unknown type lists the allowed values", () => {
+		const problems = explainQuestionProblems({ q: { type: "yesno", instructions: "x" } });
+		expect(problems[0]).toContain('questions["q"].type');
+		expect(problems[0]).toContain("choice");
+		expect(problems[0]).toContain("score");
+		expect(problems[0]).toContain("noul");
+	});
+
+	test("missing instructions names the field", () => {
+		expect(explainQuestionProblems({ q: { type: "noul" } })[0]).toContain("instructions");
+	});
+
+	test("documented limits are enforced with the limit in the message", () => {
+		const choice = (n: number) =>
+			Object.fromEntries(Array.from({ length: n }, (_, i) => [`o${i}`, `option ${i}`]));
+		expect(
+			explainQuestionProblems({ q: { type: "choice", instructions: "x", criteria: choice(1) } })[0]
+		).toContain("2-20");
+		expect(
+			explainQuestionProblems({ q: { type: "choice", instructions: "x", criteria: choice(21) } })[0]
+		).toContain("2-20");
+		const levels = (n: number) => Array.from({ length: n }, (_, i) => `L${i}`);
+		expect(
+			explainQuestionProblems({ q: { type: "score", instructions: "x", criteria: levels(1) } })[0]
+		).toContain("2-10");
+		expect(
+			explainQuestionProblems({ q: { type: "score", instructions: "x", criteria: levels(11) } })[0]
+		).toContain("2-10");
+	});
+
+	test("at most 8 questions and identifier keys of <= 64 chars", () => {
+		const nine = Object.fromEntries(
+			Array.from({ length: 9 }, (_, i) => [`q${i}`, { type: "noul", instructions: "x" }])
+		);
+		expect(explainQuestionProblems(nine)[0]).toContain("8");
+
+		expect(
+			explainQuestionProblems({ [`k`.repeat(65)]: { type: "noul", instructions: "x" } })[0]
+		).toContain("64");
+	});
+
+	test("every problem is reported at once, one per line", () => {
+		const problems = explainQuestionProblems({
+			a: { type: "nope" },
+			b: { type: "noul", instructions: "x", criteria: ["y"] },
+		});
+		expect(problems).toHaveLength(2);
+		expect(problems.every((p) => p.startsWith('questions['))).toBe(true);
+	});
+
+	test("a non-object question is reported, not thrown as a TypeError", () => {
+		expect(explainQuestionProblems({ q: "noul" })[0]).toContain('questions["q"]');
 	});
 });
