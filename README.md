@@ -7,6 +7,8 @@
 
 > **Typed decisions, not prose.** One tool call → a value your code can branch on.
 
+**Project page:** [rioliu.github.io/pi-jev-extension](https://rioliu.github.io/pi-jev-extension/)
+
 A [Pi](https://github.com/earendil-works/pi) extension that adds a **`jev_decide`** tool: ask
 [TypeSafe](https://typesafe.ai)'s **Jev System One** model a typed question and get back a value your
 code can branch on — a `choice`, a `score`, or a `noul` (yes/no probability). Jev never returns prose.
