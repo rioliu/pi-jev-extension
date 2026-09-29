@@ -91,9 +91,16 @@ following usage patterns from the Jev ecosystem study ([arXiv:2609.30216](https:
 
 - **Batch related questions** — one `state` carries up to 8 questions of mixed types; the prompt prefers
   one call with three related questions over three sequential calls (one round trip, one shared state).
-- **Gate on confidence** — act only on decisive results (choice/score `confidence` ≥ 0.5, `noul` ≤ 0.3 or
-  ≥ 0.7). An inconclusive answer is *no signal*: decide from the evidence, and ask the user before
-  irreversible actions ("accept when confident, escalate when unsure").
+- **Gate on confidence in three tiers** — *decisive* (`choice`/`score` `confidence` ≥ 0.9, `noul` ≤ 0.1 or
+  ≥ 0.9) → act on it; *weak middle* (`confidence` 0.5–0.9, `noul` 0.1–0.3 or 0.7–0.9) → corroboration
+  only: it may reinforce what the evidence in context already shows, but never carries an irreversible
+  action alone (show the user), and when it matters, decompose the state into narrower yes/no questions
+  and re-ask; *no signal* (`confidence` < 0.5, `noul` 0.3–0.7) → ignore it, decide from the evidence, and
+  ask the user before irreversible actions ("accept when confident, escalate when unsure"). The cutoffs
+  sit at the measured accuracy cliffs, not at round numbers: [Aman Kumar's 16K-call study](https://amankumar.ai/blogs/jev-measured)
+  reports 90–100% accuracy at ≥ 0.9 confidence and a 6–83% band through the middle;
+  [arXiv:2609.24574](https://arxiv.org/abs/2609.24574) puts median accuracy at 0.815 above 0.9 and
+  shows high-confidence failures can still occur task-by-task.
 - **Descriptive option keys** — decisions follow the option *name*, not just the rubric bound to it:
   short, discriminative, mutually exclusive keys and descriptions.
 - **Deterministic policy stays in charge** — an explicit user instruction always wins over Jev, and Jev
