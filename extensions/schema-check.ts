@@ -138,6 +138,7 @@ const main = async () => {
 		"it only returns choices, scores, and probabilities",
 		"If Jev capacity is unavailable the tool automatically falls back",
 		"less calibrated second opinions",
+		"Batch related questions into a single",
 	];
 
 	const concatProblems = (d: string): string[] => {
@@ -170,7 +171,7 @@ const main = async () => {
 	);
 
 	const guidelines = (jevTool.promptGuidelines ?? []) as string[];
-	assert(guidelines.length >= 7, `promptGuidelines present (${guidelines.length})`);
+	assert(guidelines.length >= 10, `promptGuidelines present (${guidelines.length})`);
 	assert(
 		guidelines.some((g) => g.includes("Never JSON-encode it into a string")),
 		"guideline warns against JSON-encoding questions"
@@ -183,6 +184,25 @@ const main = async () => {
 	assert(
 		guidelines.some((g) => g.includes("NO `confidence` field")),
 		"guideline explains noul has no confidence field"
+	);
+	// Usage lessons from the Jev ecosystem study (arXiv:2609.30216): batch
+	// related questions in one request, gate on confidence, and name option
+	// keys descriptively - each must stay in the prompt the model reads.
+	assert(
+		guidelines.some((g) => g.includes("one round trip")),
+		"guideline teaches batching related questions into one call"
+	);
+	assert(
+		guidelines.some((g) => g.includes("accept when confident, escalate when unsure")),
+		"guideline teaches confidence gating"
+	);
+	assert(
+		guidelines.some((g) => g.includes("follows the option name")),
+		"guideline teaches descriptive option keys"
+	);
+	assert(
+		guidelines.some((g) => g.includes("An explicit user instruction always wins over Jev")),
+		"guideline keeps user instruction in precedence over Jev"
 	);
 	assert(desc.includes("`legend`"), "description mentions the result legend");
 	assert(ANSWER_LEGEND.includes("P(yes)"), "ANSWER_LEGEND documents noul semantics");

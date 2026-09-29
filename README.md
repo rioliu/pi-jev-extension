@@ -84,6 +84,23 @@ A JSON-*encoded* string is accepted and parsed (with bounded repair for an unbal
 but the object form is canonical — a string carries no structure guarantee, and that is where malformed
 values get through. Anything unrecoverable is rejected **before** a request is sent.
 
+### What the tool prompt teaches the model
+
+The `promptGuidelines` injected into the session aim for use that is both *reasonable* and *efficient*,
+following usage patterns from the Jev ecosystem study ([arXiv:2609.30216](https://arxiv.org/abs/2609.30216)):
+
+- **Batch related questions** — one `state` carries up to 8 questions of mixed types; the prompt prefers
+  one call with three related questions over three sequential calls (one round trip, one shared state).
+- **Gate on confidence** — act only on decisive results (choice/score `confidence` ≥ 0.5, `noul` ≤ 0.3 or
+  ≥ 0.7). An inconclusive answer is *no signal*: decide from the evidence, and ask the user before
+  irreversible actions ("accept when confident, escalate when unsure").
+- **Descriptive option keys** — decisions follow the option *name*, not just the rubric bound to it:
+  short, discriminative, mutually exclusive keys and descriptions.
+- **Deterministic policy stays in charge** — an explicit user instruction always wins over Jev, and Jev
+  remains a second opinion the model overrides when evidence contradicts it.
+- **Don't call when the answer is in context** — trivially answerable questions, explanations, and
+  anything needing prose never reach Jev.
+
 ## Reading the result
 
 Every result carries a `legend` field restating this, so it stays with the data:
