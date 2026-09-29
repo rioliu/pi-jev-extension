@@ -114,11 +114,14 @@ export const jevTool = defineTool({
 	promptGuidelines: [
 		"Before running a destructive or hard-to-reverse command (rm, force-push, drop table, migration, git reset --hard), call jev_decide with a 'noul' question 'Is this action safe given the intended change?' and only proceed if noul < 0.3; if noul >= 0.3, show the user the probability and wait for confirmation.",
 		"For failure analysis (failed test, CI build error, prod exception), call jev_decide with the failure output, recent changes, and pass/fail history as state: a 'noul' 'Is this flaky or a real bug?' (flaky >= 0.7 -> rerun once; otherwise investigate), and when the cause is unclear a 'choice' over root-cause hypotheses (env flake / real bug / brittle test / unknown) to pick the next step. Do not guess flakiness from a single error line alone - include reproduction results and history in state.",
-		"When choosing between 2-4 concrete approaches and the tradeoff is genuinely close, call jev_decide with a 'choice' question listing the options and their tradeoffs; use its answer as a second opinion, but override it and explain when you have evidence it missed.",
+		"When choosing between 2-4 concrete approaches and the tradeoff is genuinely close, call jev_decide with a 'choice' question listing the options and their tradeoffs; use its answer as a second opinion, but override it and explain when you have evidence it missed. An explicit user instruction always wins over Jev, and an answer you cannot read or that contradicts the facts means keep your current plan.",
 		"When evaluating AI- or self-generated output (a patch, answer, or plan) against a rubric, call jev_decide with a 'score' question before presenting it as done; if score is in the bottom level, keep working instead of presenting it.",
+		"When several judgments share the same context, batch them into ONE call: one `state` can carry up to 8 questions of mixed types (e.g. a risk noul + a severity score + a root-cause choice), answered together in one round trip - prefer one jev_decide call with three related questions over three sequential calls.",
+		"Jev follows the option name, not just the rubric bound to it: use short descriptive choice keys (env_flake, not b) with discriminative, mutually exclusive descriptions - an ambiguous key cannot be rescued by its description, so never offer overlapping options.",
 		"Do not call jev_decide for questions you can answer directly from the code or docs in context, for anything needing explanation or code generation, or when the user did not ask for a second opinion and no guideline above applies - Jev returns only choices, scores, and probabilities, never prose.",
 		"jev_decide: pass `questions` as a nested JSON object mapping each short key to its question, e.g. {\"qa\": {\"type\": \"noul\", \"instructions\": \"...\"}}. Never JSON-encode it into a string - a string carries no structure guarantee, and that is where unbalanced braces and missing keys get through. Malformed values are rejected before any request is sent.",
 		"Reading a jev_decide result: `answers[key].noul` = P(yes) in 0..1 with NO `confidence` field (the probability is the certainty); `answers[key].choice` = the selected label, with `probabilities` = full distribution and `confidence` 0..1; `answers[key].score` = position on the criteria scale you supplied and MAY be fractional (e.g. 1.4), so never assume an integer. `source: \"jev\"` = Jev answered, `source: \"fallback\"` = the session model answered (less calibrated). Branch on these typed values; Jev never returns prose.",
+		"Gate every answer on confidence - accept when confident, escalate when unsure: act only on decisive results (choice/score `confidence` >= 0.5, or `noul` <= 0.3 / >= 0.7). An inconclusive result is no signal: treat it as undecided, decide from the evidence in context, and ask the user before irreversible actions rather than following a weak answer.",
 	],
 	description:
 		"Ask the Jev decision model (TypeSafe System One) to evaluate a state against typed questions and return structured answers. " +
@@ -129,7 +132,8 @@ export const jevTool = defineTool({
 		"falls back to the session model; the result then has source: \"fallback\" with a fallbackReason - treat " +
 		"those answers as less calibrated second opinions. Every result carries a `legend` explaining how to " +
 		"read `.noul` (P(yes) 0..1, no confidence field), `.choice` (plus probabilities and confidence), and " +
-		"`.score` (position on your criteria scale, may be fractional).",
+		"`.score` (position on your criteria scale, may be fractional). Batch related questions into a single " +
+		"call - they are answered together in one round trip.",
 	parameters: Type.Object({
 		state: Type.String({
 			description:
