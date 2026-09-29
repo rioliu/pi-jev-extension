@@ -1,7 +1,7 @@
 # pi-jev-extension
 
 [![License: MIT](https://img.shields.io/github/license/rioliu/pi-jev-extension)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-81%20passing-brightgreen)](#development)
+[![CI](https://github.com/rioliu/pi-jev-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/rioliu/pi-jev-extension/actions/workflows/ci.yml)
 [![Pi extension](https://img.shields.io/badge/Pi-extension-6c5ce7)](https://github.com/earendil-works/pi)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-000000)](https://bun.sh)
 
