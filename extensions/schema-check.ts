@@ -80,6 +80,20 @@ const main = async () => {
 
 	// --- rejected forms ---
 	assert(!(await acceptsSchema([1, 2])), "schema rejects an array");
+
+	// noul.criteria is a MAP. Verified against the live API: an array returns 422,
+	// a dict returns 200 - so the schema must refuse the array locally rather than
+	// let the caller hit a hard API error (422 is a surfaced error, not a fallback).
+	assert(
+		await acceptsSchema({
+			q: { type: "noul", instructions: "x", criteria: { yes: "affirmative", no: "negative" } },
+		}),
+		"noul with a criteria MAP is accepted"
+	);
+	assert(
+		!(await acceptsSchema({ q: { type: "noul", instructions: "x", criteria: ["yes", "no"] } })),
+		"noul with a criteria ARRAY is rejected locally (the API would 422)"
+	);
 	// Note: pi's validator normalizes `null` in a way that lets it past the schema,
 	// so the schema alone is not the barrier for null - coerceQuestions() is.
 	// The `bad` list below asserts the combined invariant, which is what matters.

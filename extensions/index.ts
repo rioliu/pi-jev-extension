@@ -66,7 +66,11 @@ const questionSchema = Type.Union(
 			}),
 			instructions: Type.String({ description: "The yes/no question, up to 1800 chars" }),
 			criteria: Type.Optional(
-				Type.Array(Type.String(), { description: "Optional label descriptions" })
+				Type.Record(Type.String(), Type.String(), {
+					description:
+						"Optional label descriptions as a map, e.g. {\"yes\": \"affirmative\", \"no\": \"negative\"}. " +
+						"Must be an object - the API rejects an array with 422.",
+				})
 			),
 		}),
 	],
