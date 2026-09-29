@@ -196,6 +196,21 @@ const main = async () => {
 		guidelines.some((g) => g.includes("accept when confident, escalate when unsure")),
 		"guideline teaches confidence gating"
 	);
+	// Three tiers, thresholds at the measured accuracy cliffs (Aman Kumar's
+	// 16K-call study: >=0.9 confident = 90-100% accurate, ends hold, middle is
+	// unreliable; arXiv:2609.24574: >0.9 confidence = median 0.815 accuracy).
+	assert(
+		guidelines.some((g) => g.includes("three tiers")),
+		"guideline states the three confidence tiers"
+	);
+	assert(
+		guidelines.some((g) => g.includes(">= 0.9")),
+		"guideline pins the decisive threshold at 0.9"
+	);
+	assert(
+		guidelines.some((g) => g.includes("corroboration, not verdicts")),
+		"guideline explains how to handle weak middle answers"
+	);
 	assert(
 		guidelines.some((g) => g.includes("follows the option name")),
 		"guideline teaches descriptive option keys"
@@ -206,6 +221,16 @@ const main = async () => {
 	);
 	assert(desc.includes("`legend`"), "description mentions the result legend");
 	assert(ANSWER_LEGEND.includes("P(yes)"), "ANSWER_LEGEND documents noul semantics");
+	// The gate travels WITH the data: a consuming model reading only the result
+	// must still know which bands it may act on.
+	assert(
+		ANSWER_LEGEND.includes("0.9"),
+		"ANSWER_LEGEND carries the decisive threshold"
+	);
+	assert(
+		ANSWER_LEGEND.toLowerCase().includes("weak signal"),
+		"ANSWER_LEGEND names the weak middle band"
+	);
 	assert(ANSWER_LEGEND.includes("fractional"), "ANSWER_LEGEND documents fractional score");
 	assert(
 		guidelines.every((g) => !g.includes("NaN") && !g.includes("[object Object]")),

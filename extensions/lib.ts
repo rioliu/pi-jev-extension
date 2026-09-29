@@ -321,7 +321,11 @@ export const ANSWER_LEGEND =
 	"`.probabilities` = the full distribution over your criteria keys and `.confidence` in 0..1; " +
 	"`.score` = position on the criteria scale you supplied and MAY be fractional (e.g. 1.57); " +
 	"its own `legend` maps level index -> your label and its `probabilities` gives the spread over " +
-	"those levels, so 1.57 sits between 'medium' and 'high'. Do not assume an integer. (The " +
+	"those levels, so 1.57 sits between 'medium' and 'high'. Do not assume an integer. " +
+	"Gate: act only on a DECISIVE answer - choice/score `confidence` >= 0.9, or `noul` <= 0.1 or >= 0.9. " +
+	"A WEAK SIGNAL (choice/score 0.5-0.9, `noul` 0.1-0.3 or 0.7-0.9) corroborates the evidence but must " +
+	"never carry an irreversible action alone; NO SIGNAL (choice/score < 0.5, `noul` 0.3-0.7) is ignored " +
+	"and you decide from the evidence in context. (The " +
 	"top-level `legend` in this result is THIS note, not part of any answer.) " +
 	"`source: \"jev\"` = answered by Jev, `source: \"fallback\"` = " +
 	"answered by the session model, treat those as less calibrated. Branch on these typed " +

@@ -711,6 +711,15 @@ describe("buildToolResult", () => {
 		expect(ANSWER_LEGEND.toLowerCase()).toContain("no `confidence` field");
 	});
 
+	test("legend carries the three-tier gate so the answer is actionable on its own", () => {
+		// The thresholds must ride along with every result - the consuming model
+		// may see the legend without the tool prompt (e.g. replayed logs).
+		expect(ANSWER_LEGEND).toContain(">= 0.9");
+		expect(ANSWER_LEGEND).toContain("<= 0.1");
+		expect(ANSWER_LEGEND.toLowerCase()).toContain("weak signal");
+		expect(ANSWER_LEGEND.toLowerCase()).toContain("no signal");
+	});
+
 	test("legend warns that score may be fractional", () => {
 		expect(ANSWER_LEGEND.toLowerCase()).toContain("fractional");
 	});
