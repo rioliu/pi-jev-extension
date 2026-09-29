@@ -1,5 +1,12 @@
 # pi-jev-extension
 
+[![License: MIT](https://img.shields.io/github/license/rioliu/pi-jev-extension)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-81%20passing-brightgreen)](#development)
+[![Pi extension](https://img.shields.io/badge/Pi-extension-6c5ce7)](https://github.com/earendil-works/pi)
+[![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-000000)](https://bun.sh)
+
+> **Typed decisions, not prose.** One tool call → a value your code can branch on.
+
 A [Pi](https://github.com/earendil-works/pi) extension that adds a **`jev_decide`** tool: ask
 [TypeSafe](https://typesafe.ai)'s **Jev System One** model a typed question and get back a value your
 code can branch on — a `choice`, a `score`, or a `noul` (yes/no probability). Jev never returns prose.
