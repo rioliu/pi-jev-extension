@@ -1,6 +1,6 @@
 {
   "name": "pi-jev-extension",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension providing jev_decide: typed choices, scores and yes/no probabilities from TypeSafe's Jev System One model, with automatic session-model fallback.",
   "type": "module",
   "keywords": [
@@ -24,7 +24,9 @@
   },
   "homepage": "https://github.com/rioliu/pi-jev-extension#readme",
   "pi": {
-    "extensions": ["./extensions/index.ts"],
+    "extensions": [
+      "./extensions/index.ts"
+    ],
     "image": "https://rioliu.github.io/pi-jev-extension/screenshot.png"
   },
   "bugs": {
