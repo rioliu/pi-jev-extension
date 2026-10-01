@@ -24,6 +24,7 @@
   },
   "homepage": "https://github.com/rioliu/pi-jev-extension#readme",
   "pi": {
+    "extensions": ["./extensions/index.ts"],
     "image": "https://rioliu.github.io/pi-jev-extension/screenshot.png"
   },
   "bugs": {
