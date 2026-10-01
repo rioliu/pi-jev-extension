@@ -35,6 +35,7 @@ the same question to your session model** instead, and marks the result `source:
 ## Install
 
 ```bash
+pi install npm:pi-jev-extension                       # from npm (gallery package)
 pi install git:github.com/rioliu/pi-jev-extension   # as a Pi package
 pi install ./pi-jev-extension                          # from a local checkout
 ```

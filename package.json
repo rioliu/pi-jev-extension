@@ -13,11 +13,19 @@
     "guardrails"
   ],
   "license": "MIT",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/rioliu/pi-jev-extension.git"
   },
   "homepage": "https://github.com/rioliu/pi-jev-extension#readme",
+  "pi": {
+    "image": "https://rioliu.github.io/pi-jev-extension/screenshot.png"
+  },
   "bugs": {
     "url": "https://github.com/rioliu/pi-jev-extension/issues"
   },
