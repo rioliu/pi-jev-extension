@@ -1,8 +1,9 @@
 /**
- * Pure logic for the jev_decide tool: capacity classification, circuit-breaker
- * preflight, fallback prompt building, answer normalization, and the main
- * decide flow. No pi imports - everything external is injected so this module
- * is unit-testable standalone.
+ * Pure logic for the jev_decide tool: circuit-breaker preflight, fallback
+ * prompt building, answer normalization, and the main decide flow. No pi
+ * imports - everything external is injected so this module is unit-testable
+ * standalone. The only transport is pi's classifier API (ctx.modelRegistry
+ * .classify), injected as ClassifyFn.
  */
 
 export type QuestionType = "choice" | "score" | "noul";
@@ -18,7 +19,6 @@ export type Questions = Record<string, QuestionDef>;
 export interface DecideParams {
 	state: string;
 	questions: Questions;
-	model?: string;
 }
 
 export interface UsageCost {
@@ -320,8 +320,8 @@ export const ANSWER_LEGEND =
 	"field, the probability itself is the certainty; `.choice` = the selected label, with " +
 	"`.probabilities` = the full distribution over your criteria keys and `.confidence` in 0..1; " +
 	"`.score` = position on the criteria scale you supplied and MAY be fractional (e.g. 1.57); " +
-	"its own `legend` maps level index -> your label and its `probabilities` gives the spread over " +
-	"those levels, so 1.57 sits between 'medium' and 'high'. Do not assume an integer. " +
+	"its own `legend` maps level index -> your label and its `probabilities`, when present, gives " +
+	"the spread over those levels, so 1.57 sits between 'medium' and 'high'. Do not assume an integer. " +
 	"Gate: act only on a DECISIVE answer - choice/score `confidence` >= 0.9, or `noul` <= 0.1 or >= 0.9. " +
 	"A WEAK SIGNAL (choice/score 0.5-0.9, `noul` 0.1-0.3 or 0.7-0.9) corroborates the evidence but must " +
 	"never carry an irreversible action alone; NO SIGNAL (choice/score < 0.5, `noul` 0.3-0.7) is ignored " +
@@ -351,47 +351,160 @@ export function buildToolResult(outcome: DecisionOutcome): ToolResultPayload {
 	};
 }
 
-export interface HttpLike {
-	(
-		url: string,
-		init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }
-	): PromiseLike<{ ok: boolean; status: number; text(): Promise<string> }>;
-}
-
 export interface DeciderDeps {
-	url: string;
-	apiKey?: string;
-	fetchImpl: HttpLike;
+	/** The transport: pi's builtin classifier API (ctx.modelRegistry.classify). */
+	classify?: ClassifyFn;
+	/**
+	 * Stated reason no transport can run at all (e.g. no credentialed classifier
+	 * model). Preempts everything, so the session model answers with this reason.
+	 */
+	preflightReason?: string;
 	signal?: AbortSignal;
 	circuit: CircuitBreaker;
 	fallback: (params: DecideParams) => Promise<FallbackResult>;
-	modelAlias?: string;
 	/** Max ms to wait on Jev before handing off. Defaults to DEFAULT_TIMEOUT_MS. */
 	timeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
-// Capacity classification
+// pi classifier transport (ctx.modelRegistry.classify)
 // ---------------------------------------------------------------------------
 
-/** Statuses that mean "Jev cannot serve right now" rather than "caller bug". */
-// 402 insufficient_credits is capacity, not a caller bug: the budget is gone, so
-// every later request is rejected too and retrying cannot help. Hand off to the
-// session model instead (docs: 402, not charged).
-const CAPACITY_STATUSES = new Set([402, 408, 425, 429, 500, 502, 503, 504, 529]);
-/** Statuses that are the caller's fault - never fall back, surface them. */
-const HARD_ERROR_STATUSES = new Set([400, 401, 403, 404, 410, 422]);
-const CAPACITY_BODY_RE =
-	/rate[ _-]?limit|quota|capacity|overload|too many requests|temporarily unavailable|service unavailable|insufficient/i;
+/**
+ * Normalized result of one call through pi's classifier API.
+ *
+ * pi's classify() never rejects: provider, auth, and capacity failures arrive
+ * as `ok: false` with a reason, which runJevDecide routes through the same
+ * circuit-breaker + session-model fallback as an HTTP capacity failure.
+ * `answers` are the raw classifier answer records - mapped onto the jev_decide
+ * contract by fromClassifierAnswers() once the questions are known.
+ */
+export type ClassifyOutcome =
+	| { ok: true; model: string; answers: Record<string, unknown>; usage?: UsageLike }
+	| { ok: false; reason: string };
+
+/** One classifier call; receives the same combined signal a fetch would. */
+export type ClassifyFn = (params: DecideParams, signal: AbortSignal) => Promise<ClassifyOutcome>;
+
+/** Structural twin of pi's ClassifierQuestion - lib.ts stays pi-import-free. */
+export type ClassifierQuestionShape =
+	| { type: "choice"; instructions: string; criteria: Record<string, string> }
+	| { type: "score"; instructions: string; criteria: string[] }
+	| { type: "bool"; instructions: string; criteria: { true: string; false: string } };
 
 /**
- * True when a non-2xx Jev response indicates insufficient capacity /
- * unavailability, i.e. the fallback path should take over.
+ * noul.criteria is a free-form label map; pi's bool question needs fixed
+ * {true, false} branch labels. Recognize true/yes and false/no keys (the shape
+ * verified against the live API: {"yes": "affirmative", "no": "negative"}),
+ * otherwise label the branches plainly - the probability direction (P(yes))
+ * never depends on the labels.
  */
-export function isCapacityFailure(status: number, body: string): boolean {
-	if (CAPACITY_STATUSES.has(status)) return true;
-	if (HARD_ERROR_STATUSES.has(status)) return false;
-	return CAPACITY_BODY_RE.test(body);
+function toBoolCriteria(criteria: string[] | Record<string, string> | undefined): {
+	true: string;
+	false: string;
+} {
+	if (criteria !== undefined && !Array.isArray(criteria)) {
+		const keys = Object.keys(criteria);
+		const t = keys.find((k) => /^(true|yes)$/i.test(k));
+		const f = keys.find((k) => /^(false|no)$/i.test(k));
+		if (t !== undefined && f !== undefined) {
+			return { true: criteria[t], false: criteria[f] };
+		}
+	}
+	return { true: "yes", false: "no" };
+}
+
+/**
+ * Convert validated jev_decide questions into pi's classifier question shapes:
+ * the only structural change is noul -> bool (pi's wire-level name for the same
+ * yes/no question). Callers must run explainQuestionProblems() first, which
+ * guarantees choice carries a criteria map and score a criteria array.
+ */
+export function toClassifierQuestions(
+	questions: Questions
+): Record<string, ClassifierQuestionShape> {
+	const out: Record<string, ClassifierQuestionShape> = {};
+	for (const [key, q] of Object.entries(questions)) {
+		if (q.type === "choice") {
+			out[key] = {
+				type: "choice",
+				instructions: q.instructions,
+				criteria: (q.criteria ?? {}) as Record<string, string>,
+			};
+		} else if (q.type === "score") {
+			out[key] = {
+				type: "score",
+				instructions: q.instructions,
+				criteria: (q.criteria ?? []) as string[],
+			};
+		} else {
+			out[key] = {
+				type: "bool",
+				instructions: q.instructions,
+				criteria: toBoolCriteria(q.criteria),
+			};
+		}
+	}
+	return out;
+}
+
+/**
+ * pi's classify() takes JSON state; the tool takes raw text. A JSON object is
+ * passed through untouched (a caller who structured the decision context keeps
+ * that structure); anything else is wrapped under `text` so no information is
+ * lost - the classifier must never see less than the direct endpoint saw.
+ */
+export function toClassifierState(state: string): Record<string, unknown> {
+	try {
+		const parsed: unknown = JSON.parse(state);
+		if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return parsed as Record<string, unknown>;
+		}
+	} catch {
+		// not JSON - wrap below
+	}
+	return { text: state };
+}
+
+/**
+ * Map classifier answers onto the jev_decide contract:
+ * - bool -> noul: P(yes) is the probability, type renamed to the tool's name;
+ * - score: keeps pi's {score, confidence} and regains its level legend, which
+ *   pi's answer parser drops - the labels are reconstructed from the question's
+ *   own criteria (never fabricated: they are exactly what the caller supplied).
+ *   A level distribution cannot be reconstructed and is only present when the
+ *   direct endpoint reports it.
+ * - choice passes through with probabilities and confidence.
+ * Keys missing from the response are omitted so validateJevAnswers() reports
+ * the omission by question key.
+ */
+export function fromClassifierAnswers(
+	raw: Record<string, unknown>,
+	questions: Questions
+): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [key, q] of Object.entries(questions)) {
+		const a = raw[key];
+		if (typeof a !== "object" || a === null || Array.isArray(a)) continue;
+		const obj = a as Record<string, unknown>;
+		if (q.type === "noul" && obj.type === "bool") {
+			const { type: _type, probability, ...rest } = obj;
+			out[key] = { ...rest, type: "noul", noul: probability };
+		} else if (q.type === "score" && obj.type === "score") {
+			const legend: Record<string, string> = {};
+			if (Array.isArray(q.criteria)) {
+				q.criteria.forEach((label, i) => {
+					legend[String(i)] = label;
+				});
+			}
+			out[key] = { ...obj, legend: (obj.legend as unknown) ?? legend };
+		} else {
+			// choice passes through; a type mismatch is passed through too, so
+			// validateJevAnswers() can name it with the question key.
+			out[key] = obj;
+		}
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -665,43 +778,53 @@ function isAbortError(e: unknown): boolean {
 }
 
 /**
- * Run one decide request. Preflight: while the circuit is open (recent capacity
- * failure) or no API key is configured, skip Jev and use the fallback directly.
- * A capacity-classified Jev failure opens the circuit and falls back mid-call.
- * Non-capacity Jev errors and aborts are surfaced without falling back.
+ * Run one decide request over pi's classifier transport. Preflight: a stated
+ * preflight reason (no credentialed classifier) or an open circuit skips the
+ * classifier entirely and the session model answers. A classifier failure opens
+ * the circuit and falls back mid-call; aborts are surfaced without falling back.
  */
 export async function runJevDecide(
 	params: DecideParams,
 	deps: DeciderDeps
 ): Promise<DecisionOutcome> {
-	// Preflight: is Jev worth attempting right now?
-	if (!deps.apiKey) {
-		return fallbackOutcome(params, deps, "JEVMODEL_API_KEY not set");
+	if (deps.preflightReason) {
+		return fallbackOutcome(params, deps, deps.preflightReason);
+	}
+	if (!deps.classify) {
+		// Transport resolution (index.ts) always provides one or the other; this
+		// guards a wiring bug, not a runtime condition.
+		throw new Error("runJevDecide: no classifier transport configured");
 	}
 	if (!deps.circuit.canAttempt()) {
 		return fallbackOutcome(params, deps, "jev capacity circuit open (recent capacity failure)");
 	}
 
-	let res: { ok: boolean; status: number; text(): Promise<string> };
-	// #5: bound the wait so a hung gateway cannot stall the agent - a timeout is
-	// "Jev cannot serve us", so it falls back like any other capacity failure.
+	// #5: bound the wait so a hung classifier cannot stall the agent - a timeout
+	// is "Jev cannot serve us", so it falls back like any other capacity failure.
 	const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const timeoutSignal = timeoutSignalOf(timeoutMs);
 	const requestSignal = combineSignals(deps.signal, timeoutSignal);
+
+	return runViaClassify(params, deps, requestSignal, timeoutSignal, timeoutMs);
+}
+
+/**
+ * One decide request over pi's classifier transport. Signal dispatch: caller
+ * abort propagates, our deadline fires a timeout fallback, and any provider-side
+ * failure opens the circuit and hands the same questions to the session model.
+ * questions to the session model.
+ */
+async function runViaClassify(
+	params: DecideParams,
+	deps: DeciderDeps,
+	requestSignal: AbortSignal,
+	timeoutSignal: AbortSignal,
+	timeoutMs: number
+): Promise<DecisionOutcome> {
+	const classify = deps.classify!;
+	let res: ClassifyOutcome;
 	try {
-		res = await deps.fetchImpl(deps.url, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${deps.apiKey}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				model: params.model ?? deps.modelAlias ?? "jev-latest",
-				state: params.state,
-				questions: params.questions,
-			}),
-			signal: requestSignal,
-		});
+		res = await classify(params, requestSignal);
 	} catch (e) {
 		// The caller cancelled (pi is shutting down / the user aborted): propagate.
 		if (deps.signal?.aborted) throw e;
@@ -712,52 +835,29 @@ export async function runJevDecide(
 		}
 		if (isAbortError(e)) throw e;
 		deps.circuit.recordFailure();
-		return fallbackOutcome(params, deps, `jev unreachable: ${e instanceof Error ? e.message : String(e)}`);
-	}
-
-	if (!res.ok) {
-		const body = await res.text();
-		if (isCapacityFailure(res.status, body)) {
-			deps.circuit.recordFailure();
-			return fallbackOutcome(
-				params,
-				deps,
-				`jev HTTP ${res.status}: ${snippet(body)}`
-			);
-		}
-		throw new Error(`Jev API ${res.status}: ${body.slice(0, 500)}`);
-	}
-
-	// #4: read the body as text and parse explicitly - a 200 carrying an HTML
-	// error page must surface as a readable Jev error, not a JSON.parse crash.
-	const raw = await res.text();
-	let data: {
-		model?: string;
-		answers?: unknown;
-		usage?: { input_tokens?: number; output_tokens?: number };
-	};
-	try {
-		data = JSON.parse(raw) as typeof data;
-	} catch (e) {
-		throw new Error(
-			`Jev API ${res.status} returned a non-JSON body: ${snippet(raw)} (${
-				e instanceof Error ? e.message : String(e)
-			})`
+		return fallbackOutcome(
+			params,
+			deps,
+			`classify failed: ${e instanceof Error ? e.message : String(e)}`
 		);
 	}
-	// #6: an answer the consumer cannot act on is a failure, not a surprise.
-	const answers = validateJevAnswers(data.answers, params.questions);
+	if (!res.ok) {
+		// pi's classify() never rejects: auth, capacity, and upstream failures all
+		// arrive here as a reason. Caller bugs cannot - malformed questions were
+		// rejected before the call, malformed answers are rejected below.
+		deps.circuit.recordFailure();
+		return fallbackOutcome(params, deps, res.reason);
+	}	// #6: an answer the consumer cannot act on is a failure, not a surprise.
+	const answers = validateJevAnswers(
+		fromClassifierAnswers(res.answers, params.questions),
+		params.questions
+	);
 	deps.circuit.recordSuccess();
 	return {
 		source: "jev",
-		model: data.model ?? (params.model ?? deps.modelAlias ?? "jev-latest"),
+		model: res.model,
 		answers,
-		usage: toFullUsage({
-			input: data.usage?.input_tokens ?? 0,
-			output: data.usage?.output_tokens ?? 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-		}),
+		usage: res.usage ? toFullUsage(res.usage) : undefined,
 	};
 }
 

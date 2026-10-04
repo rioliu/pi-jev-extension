@@ -16,6 +16,10 @@ code can branch on — a `choice`, a `score`, or a `noul` (yes/no probability). 
 If Jev is unavailable, rate-limited, out of credit, too slow, or unreachable, the tool **silently hands
 the same question to your session model** instead, and marks the result `source: "fallback"`.
 
+The request goes through **Pi's builtin classifier API**
+(`ctx.modelRegistry.classify`) with your Pi credentials (`TYPESAFE_API_KEY`), so usage
+counts toward the session cost in the footer and `/session`.
+
 > **Unofficial.** This is an independent integration. It is not affiliated with, endorsed by, or
 > supported by TypeSafe or the Jev project.
 
@@ -23,12 +27,13 @@ the same question to your session model** instead, and marks the result `source:
 
 ## Privacy: what leaves your machine
 
-`state` is sent **verbatim** to `POST https://jevmodel.org/v1/systemone`. Whatever you put in `state`
-— source code, stack traces, tickets, logs — is transmitted to that third-party endpoint.
+`state` is sent **verbatim** to the endpoint behind the configured classifier credential —
+TypeSafe's System One endpoint with `TYPESAFE_API_KEY`, or whichever Jev-capable provider you
+configured in Pi. Whatever you put in `state` — source code, stack traces, tickets, logs — is
+transmitted to that third-party endpoint.
 
-- Do not call the tool with data your organisation forbids sending off-box.
-- Point `JEVMODEL_URL` at a deployment you control if you need data locality.
-- With no `JEVMODEL_API_KEY`, no request is made at all and the session model answers directly.
+- Do not call the tool with data your organisation forbids sending off-box to that endpoint.
+- With no classifier credential, no request is made at all: the session model answers directly.
 
 ---
 
@@ -52,10 +57,13 @@ Pi loads TypeScript directly (no build step).
 
 | Env var | Required | Default | Purpose |
 |---|---|---|---|
-| `JEVMODEL_API_KEY` | yes* | — | Bearer key from the jevmodel.org Dashboard. *Without it, every call falls back to the session model. |
-| `JEVMODEL_URL` / `JEV_URL` | no | `https://jevmodel.org/v1/systemone` | Endpoint override |
+| `TYPESAFE_API_KEY` | yes* | — | Pi's TypeSafe credential (or configure another Jev-capable provider, e.g. via OpenRouter). *Without any classifier credential the tool falls back to the session model with a stated reason. |
 | `JEVMODEL_TIMEOUT_MS` | no | `30000` | Max wait on Jev before handing off |
 | `JEVMODEL_FALLBACK_MODEL` | no | session model | Pin the fallback to `provider/modelId` |
+
+Model selection: the first credentialed classifier in Pi's registry, preferring
+`typesafe/jev-latest`. The tool's optional `model` argument overrides it as `provider/id`
+(a bare id is taken from `typesafe`, e.g. `jev-latest` or `openrouter/typesafe/jev-1.13`).
 
 ## Asking a question
 
@@ -116,7 +124,7 @@ Every result carries a `legend` field restating this, so it stays with the data:
 ```jsonc
 {
   "source": "jev",
-  "model": "jev-1.13.0",
+  "model": "typesafe/jev-latest",
   "legend": "Read answers[key]: `.noul` = P(yes) in 0..1 ...",
   "answers": {
     "root":  { "type": "choice", "choice": "dep", "confidence": 0.94,
@@ -124,6 +132,8 @@ Every result carries a `legend` field restating this, so it stays with the data:
     "flaky": { "type": "noul", "noul": 0.88 },
     "sev":   { "type": "score", "score": 1.57, "confidence": 0.48,
                "legend": { "0": "low", "1": "medium", "2": "high", "3": "critical" },
+               // score `probabilities` are not carried by Pi's classifier API;
+               // the legend is always present
                "probabilities": { "0": 0.03, "1": 0.42, "2": 0.5, "3": 0.05 } }
   }
 }
@@ -134,7 +144,7 @@ Every result carries a `legend` field restating this, so it stays with the data:
 | `answers[k].type` | mirrors the question type |
 | `answers[k].noul` | P(yes) ∈ 0..1. **Has no `confidence` field** — the probability *is* the certainty |
 | `answers[k].choice` | selected label; `probabilities` is the full distribution over your criteria keys |
-| `answers[k].score` | position on your scale — **may be fractional** (e.g. `1.57`, i.e. between `medium` and `high`). Its own `legend` maps level index → your label |
+| `answers[k].score` | position on your scale — **may be fractional** (e.g. `1.57`, i.e. between `medium` and `high`). Its own `legend` maps level index → your label (always present, reconstructed from your criteria) |
 | `answers[k].confidence` | 0..1, present for `choice` and `score`, **absent for `noul`** |
 | `source` | `"jev"` or `"fallback"` — treat fallback answers as less calibrated |
 | `legend` | *top-level* — this documentation note, not part of any answer |
@@ -142,17 +152,35 @@ Every result carries a `legend` field restating this, so it stays with the data:
 `answers` is validated against the questions you asked: a missing answer, an unknown `choice`, a
 non-numeric `score`, or a `noul` outside 0..1 fails loudly instead of reaching your model silently.
 
+## Versus Pi's builtin classifier API
+
+Pi ≥ 1.0 exposes the same Jev System One model in two more places: `models.classify()` inside
+`codemode` scripts (off by default) and `ctx.modelRegistry.classify()` for extensions. This
+extension **uses the latter as its transport** and still earns its place as a tool:
+
+- **First-class tool, no codemode required** — `jev_decide` is in every session without enabling
+  script mode, with a strict schema and per-field validation errors the model can act on.
+- **Usage policy in the prompt** — the `promptGuidelines` teach batching, three-tier confidence
+  gating, and when *not* to call. The builtin API ships no policy; a script model would have to
+  invent one.
+- **Automatic session-model fallback + circuit breaker** — builtin `classify()` returns
+  `stopReason: "error"` and stops; this tool degrades to the session model and remembers capacity
+  failures.
+- **Answer validation** — responses are checked against the questions asked before the model sees
+  them; the builtin leaves that to the caller.
+
+If you only need raw classification inside a script, use `models.classify()` directly — it is
+cheaper than routing through a tool.
+
 ## Failure handling
 
 | Condition | Behaviour |
 |---|---|
-| `401` auth / `422` invalid request | surfaced as an error (your bug) |
-| `402` insufficient credits | fallback — retrying cannot help, every later call is rejected too |
-| `429` rate limit / `502` upstream | fallback + circuit opens |
-| timeout (`JEVMODEL_TIMEOUT_MS`) | fallback |
-| network error | fallback |
-| HTTP 200 with a non-JSON body | error quoting the offending body |
+| Classifier provider error (auth, invalid request, quota, upstream) | fallback + circuit opens — Pi reports these as one `errorMessage`; malformed questions are still rejected before the call, and malformed answers still fail loudly after it |
+| timeout (`JEVMODEL_TIMEOUT_MS`) | fallback + circuit opens |
+| no classifier credentials | fallback with a stated preflight reason |
 | malformed `questions` | error **before** any request |
+| malformed answers from the model | error, never silently passed to the consuming model |
 
 Capacity failures open a circuit breaker, so while it is open no Jev request is attempted at all —
 the session model serves every call — and one half-open probe after the cooldown detects recovery.
@@ -165,6 +193,11 @@ bun test             # unit tests
 bun run extensions/schema-check.ts   # schema + prompt-definition integrity
 bun run typecheck
 ```
+
+Typecheck pins `@earendil-works/pi-ai` and `pi-coding-agent` at 1.0.2 as devDependencies - the
+classifier types (`ClassifierModel`, `ctx.modelRegistry.classify`) do not exist in older releases.
+At runtime the extension uses the host Pi's own packages; on a Pi older than 1.0 the tool
+reports a preflight reason and the session model answers.
 
 `schema-check.ts` asserts the tool contract *and* guards the prompt the consuming model reads — it
 self-tests that it would catch a string-concatenation artifact (a stray `+` once turned an entire

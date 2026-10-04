@@ -3,21 +3,31 @@
  *
  * Jev is not a chat model: it evaluates one state against typed questions
  * (choice / score / noul) and returns structured answers to branch on.
- * Endpoint: POST https://jevmodel.org/v1/systemone
- * Auth: Bearer $JEVMODEL_API_KEY (create a key in the jevmodel.org dashboard)
  *
- * Capacity handling: a circuit breaker remembers capacity failures
- * (429/5xx/network). While open, calls skip Jev and fall back to the session
- * model (Mimo by default), which answers the same typed questions itself.
- * Fallback answers are marked with source: "fallback" and a reason.
+ * Transport: pi's builtin classifier API (ctx.modelRegistry.classify) with a
+ * credentialed classifier from the model registry - TYPESAFE_API_KEY by
+ * default (typesafe/jev-latest, else the first credentialed classifier). Its
+ * usage lands in the session cost (footer and /session). The tool's `model`
+ * argument overrides the pick as provider/id (bare id = typesafe).
  *
- * Env: JEVMODEL_URL (override endpoint, for tests),
+ * Capacity handling: a circuit breaker remembers classifier failures
+ * (429/5xx/network/timeout/auth). While open, calls skip Jev and fall back to
+ * the session model (Mimo by default), which answers the same typed questions
+ * itself. Fallback answers are marked with source: "fallback" and a reason.
+ *
+ * Env: TYPESAFE_API_KEY (classifier provider credential),
  *      JEVMODEL_FALLBACK_MODEL ("provider/modelId" to pin the fallback model),
  *      JEVMODEL_TIMEOUT_MS (max ms to wait on Jev before handing off; default 30000).
  */
 
-import { Type, validateToolArguments, type JsonObject } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	Type,
+	validateToolArguments,
+	type ClassifierApi,
+	type ClassifierModel,
+	type JsonObject,
+} from "@earendil-works/pi-ai";
+import { defineTool, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 import {
 	buildFallbackMessages,
@@ -26,13 +36,16 @@ import {
 	coerceQuestions,
 	explainQuestionProblems,
 	runJevDecide,
+	toClassifierQuestions,
+	toClassifierState,
+	type ClassifyFn,
+	type ClassifyOutcome,
 	type DecideParams,
+	type DeciderDeps,
 	type FallbackResult,
 	type Questions,
 	type UsageLike,
 } from "./lib.ts";
-
-const JEV_URL = "https://jevmodel.org/v1/systemone";
 
 /** Shared across calls in a session so the preflight sees prior failures. */
 const circuit = new CircuitBreaker();
@@ -155,7 +168,12 @@ export const jevTool = defineTool({
 			}
 		),
 		model: Type.Optional(
-			Type.String({ description: "Model alias, defaults to jev-latest" })
+			Type.String({
+				description:
+					"Classifier model as provider/id (a bare id is taken from typesafe), e.g. jev-latest " +
+					"or openrouter/typesafe/jev-1.13; defaults to the first credentialed classifier, " +
+					"preferring typesafe/jev-latest",
+			})
 		),
 	}),
 
@@ -166,13 +184,16 @@ export const jevTool = defineTool({
 		const decideParams: DecideParams = {
 			state: params.state,
 			questions,
-			model: params.model,
 		};
 
+		// Resolve the classifier model (provider/id override or default).
+		const resolved = await resolveClassifierModel(ctx.modelRegistry, params.model);
+		const transport: TransportDeps =
+			"model" in resolved
+				? { classify: classifyVia(ctx.modelRegistry, resolved.model) }
+				: { preflightReason: resolved.preflight };
 		const outcome = await runJevDecide(decideParams, {
-			url: process.env.JEV_URL ?? process.env.JEVMODEL_URL ?? JEV_URL,
-			apiKey: process.env.JEVMODEL_API_KEY,
-			fetchImpl: fetch,
+			...transport,
 			signal: signal ?? undefined,
 			circuit,
 			timeoutMs: resolveTimeoutMs(),
@@ -196,6 +217,98 @@ export const jevTool = defineTool({
 		};
 	},
 });
+
+/** Transport fragment runJevDecide can run with (exactly one field is filled). */
+type TransportDeps = Pick<DeciderDeps, "classify" | "preflightReason">;
+
+/**
+ * Pick the classifier model. Default: the first credentialed classifier,
+ * preferring typesafe/jev-latest (pi's bundled Jev). An explicit model that
+ * exists but has no credentials gets a distinct reason from one that does not
+ * exist at all - both arrive in the fallback result the model reads.
+ */
+async function resolveClassifierModel(
+	registry: ModelRegistry,
+	requested: string | undefined
+): Promise<{ model: ClassifierModel<ClassifierApi> } | { preflight: string }> {
+	// Old pi hosts (< 1.0) have no classifier API: degrade, do not crash.
+	if (typeof registry.getAvailableOfType !== "function") {
+		return {
+			preflight: "pi >= 1.0 is required for the classifier transport",
+		};
+	}
+	const available = await registry.getAvailableOfType("classifier");
+	if (requested) {
+		const sep = requested.indexOf("/");
+		const provider = sep > 0 ? requested.slice(0, sep) : "typesafe";
+		const id = sep > 0 ? requested.slice(sep + 1) : requested;
+		const found =
+			available.find((m) => m.provider === provider && m.id === id) ??
+			registry.findOfType("classifier", provider, id);
+		if (!found) {
+			const known = available.map((m) => `${m.provider}/${m.id}`).join(", ") || "none";
+			return {
+				preflight: `classifier model "${requested}" not found (credentialed: ${known})`,
+			};
+		}
+		if (!available.some((m) => m.provider === found.provider && m.id === found.id)) {
+			return {
+				preflight: `classifier model "${requested}" has no credentials (check ${provider} auth)`,
+			};
+		}
+		return { model: found };
+	}
+	const preferred =
+		available.find((m) => m.provider === "typesafe" && m.id === "jev-latest") ?? available[0];
+	if (!preferred) {
+		return {
+			preflight:
+				"no credentialed classifier model (set TYPESAFE_API_KEY, or configure another Jev provider)",
+		};
+	}
+	return { model: preferred };
+}
+
+/**
+ * One call through pi's classifier API, normalized to ClassifyOutcome.
+ * pi's classify() never rejects: stopReason "error" carries the provider
+ * failure as a reason; "aborted" is rethrown as an AbortError so
+ * runJevDecide can dispatch caller-cancel vs its own timeout from the signals.
+ */
+function classifyVia(
+	registry: ModelRegistry,
+	model: ClassifierModel<ClassifierApi>
+): ClassifyFn {
+	return async (params, requestSignal): Promise<ClassifyOutcome> => {
+		const result = await registry.classify(
+			model,
+			{
+				state: toClassifierState(params.state) as JsonObject,
+				questions: toClassifierQuestions(params.questions),
+			},
+			{ signal: requestSignal }
+		);
+		if (result.stopReason === "aborted") {
+			const e = new Error("classify aborted");
+			e.name = "AbortError";
+			throw e;
+		}
+		if (result.stopReason !== "stop") {
+			return {
+				ok: false,
+				reason: `classify ${result.provider}/${result.model}: ${
+					result.errorMessage ?? "unknown error"
+				}`,
+			};
+		}
+		return {
+			ok: true,
+			model: `${result.provider}/${result.model}`,
+			answers: result.answers as unknown as Record<string, unknown>,
+			usage: result.usage,
+		};
+	};
+}
 
 /**
  * Resolve the fallback model: JEVMODEL_FALLBACK_MODEL ("provider/modelId")
