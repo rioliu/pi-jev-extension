@@ -8,14 +8,17 @@ import {
 	coerceQuestions,
 	explainQuestionProblems,
 	extractJsonObject,
-	isCapacityFailure,
+	fromClassifierAnswers,
 	normalizeAnswers,
 	runJevDecide,
+	toClassifierQuestions,
+	toClassifierState,
 	toFullUsage,
 	validateJevAnswers,
+	type ClassifyFn,
+	type ClassifyOutcome,
 	type DecideParams,
 	type FallbackResult,
-	type HttpLike,
 	type Questions,
 } from "./lib.ts";
 
@@ -32,38 +35,6 @@ const questions: Questions = {
 const params: DecideParams = { state: "some state", questions };
 
 /** A complete, spec-valid answer set for `questions` - what a healthy Jev returns. */
-const validJevAnswers = {
-	pick: { type: "choice", choice: "a", confidence: 0.9, probabilities: { a: 0.9, b: 0.1 } },
-	level: { type: "score", score: 1, confidence: 0.7 },
-	yesno: { type: "noul", noul: 0.5 },
-};
-
-/** payload a healthy Jev 200 returns (used by jevOk). */
-function jevOk(overrides?: Partial<Record<string, unknown>>): HttpLike {
-	const payload = {
-		model: "jev-1.13.0",
-		answers: validJevAnswers,
-		usage: { input_tokens: 10, output_tokens: 5 },
-		...overrides,
-	};
-	return async () => ({
-		ok: true,
-		status: 200,
-		text: async () => JSON.stringify(payload),
-		json: async () => payload,
-	});
-}
-
-function jevHttpError(status: number, body: string): HttpLike {
-	return async () => ({ ok: false, status, text: async () => body, json: async () => ({}) });
-}
-
-function jevNetworkError(message = "fetch failed"): HttpLike {
-	return async () => {
-		throw new TypeError(message);
-	};
-}
-
 const fullFallbackText =
 	'{"answers":{"pick":{"type":"choice","choice":"a"},"level":{"type":"score","score":1},"yesno":{"type":"noul","noul":0.5}}}';
 
@@ -73,53 +44,12 @@ function fallbackOk(text: string = fullFallbackText): (p: DecideParams) => Promi
 
 function deps(overrides: Partial<Parameters<typeof runJevDecide>[1]>) {
 	return {
-		url: "http://jev.test",
-		apiKey: "k",
-		fetchImpl: jevOk(),
 		circuit: new CircuitBreaker(),
-		fallback: fallbackOk("{}"),
+		fallback: fallbackOk(),
+		classify: classifySuccess,
 		...overrides,
 	};
 }
-
-// ---------------------------------------------------------------------------
-// capacity classification
-// ---------------------------------------------------------------------------
-
-describe("isCapacityFailure", () => {
-	test("5xx/429/408 statuses are capacity", () => {
-		for (const s of [408, 429, 500, 502, 503, 504, 529]) {
-			expect(isCapacityFailure(s, "anything")).toBe(true);
-		}
-	});
-
-	test("hard caller-error statuses are never capacity, even with keyword bodies", () => {
-		for (const s of [400, 401, 403, 404, 422]) {
-			expect(isCapacityFailure(s, "rate limit exceeded")).toBe(false);
-		}
-	});
-
-	test("capacity keywords in body of otherwise unclassified status", () => {
-		expect(isCapacityFailure(460, '{"error":"rate limit exceeded"}')).toBe(true);
-		expect(isCapacityFailure(460, "model at capacity")).toBe(true);
-		expect(isCapacityFailure(460, '{"error":"bad request shape"}')).toBe(false);
-	});
-
-	test("402 insufficient_credits is capacity by status, not by body keywords", () => {
-		// Docs: 402 | insufficient_credits | "Estimated input tokens exceed your balance."
-		// | Charged? No. A retry cannot help - every later call is rejected too, so
-		// the session model must take over. Classification must not depend on the
-		// response wording containing the word "insufficient".
-		expect(isCapacityFailure(402, "")).toBe(true);
-		expect(isCapacityFailure(402, "credit balance too low")).toBe(true);
-		expect(
-			isCapacityFailure(
-				402,
-				'{"error":{"type":"insufficient_credits","message":"Estimated input tokens exceed your balance."}}'
-			)
-		).toBe(true);
-	});
-});
 
 // ---------------------------------------------------------------------------
 // circuit breaker preflight
@@ -244,14 +174,21 @@ describe("normalizeAnswers", () => {
 // ---------------------------------------------------------------------------
 
 describe("runJevDecide", () => {
-	const jevAnswers = validJevAnswers;
-
-	test("happy path returns jev source and usage", async () => {
+	test("happy path: default deps answer via Jev with full usage", async () => {
 		const circuit = new CircuitBreaker();
-		const out = await runJevDecide(params, deps({ circuit, fetchImpl: jevOk() }));
+		const out = await runJevDecide(params, deps({ circuit }));
 		expect(out.source).toBe("jev");
-		expect(out.model).toBe("jev-1.13.0");
-		expect(out.answers).toEqual(jevAnswers);
+		expect(out.model).toBe("typesafe/jev-latest");
+		expect(out.answers).toEqual({
+			pick: piAnswers.pick,
+			level: {
+				type: "score",
+				score: 1,
+				confidence: 0.7,
+				legend: { 0: "low", 1: "mid", 2: "high" },
+			},
+			yesno: { type: "noul", noul: 0.5 },
+		});
 		expect(out.usage).toEqual({
 			input: 10,
 			output: 5,
@@ -270,7 +207,7 @@ describe("runJevDecide", () => {
 		const out = await runJevDecide(
 			params,
 			deps({
-				fetchImpl: jevHttpError(503, "at capacity"),
+				classify: classifyDown,
 				// simulate a stream usage without cost/totalTokens
 				fallback: async () => ({
 					text: fullFallbackText,
@@ -293,164 +230,30 @@ describe("runJevDecide", () => {
 		const out = await runJevDecide(
 			params,
 			deps({
-				fetchImpl: jevHttpError(503, "at capacity"),
+				classify: classifyDown,
 				fallback: async () => ({ text: fullFallbackText, model: "mimo/test" }),
 			})
 		);
 		expect(out.usage).toBeUndefined();
 	});
 
-	test("402 insufficient credits: hand off to the main model, never retry", async () => {
-		// Budget exhausted -> retrying is pointless (every later call is rejected
-		// too). Exactly one attempt, then the session model takes over and the
-		// circuit stops further Jev attempts during the cooldown.
-		const circuit = new CircuitBreaker();
-		let jevCalls = 0;
-		let fallbackCalls = 0;
-		const denied = jevHttpError(
-			402,
-			'{"error":{"type":"insufficient_credits","message":"Estimated input tokens exceed your balance."}}'
-		);
-		const counting: HttpLike = (async (input: unknown, init: never) => {
-			jevCalls++;
-			return denied(input as never, init);
-		}) as unknown as HttpLike;
-		const handOff = () => {
-			fallbackCalls++;
-			return Promise.resolve({ text: fullFallbackText, model: "mimo/test" });
-		};
-
-		const out = await runJevDecide(
-			params,
-			deps({ circuit, fetchImpl: counting, fallback: handOff })
-		);
-		expect(jevCalls).toBe(1); // exactly one attempt - no retry
-		expect(fallbackCalls).toBe(1); // main model took over
-		expect(out.source).toBe("fallback");
-		expect(circuit.isOpen).toBe(true);
-
-		// While the circuit is open, preflight skips Jev entirely.
-		await runJevDecide(params, deps({ circuit, fetchImpl: counting, fallback: handOff }));
-		expect(jevCalls).toBe(1); // still 1 - no second attempt while open
-		expect(fallbackCalls).toBe(2);
-	});
-
-	test("capacity HTTP error falls back and opens circuit", async () => {
-		const circuit = new CircuitBreaker();
-		let fallbackCalls = 0;
-		const out = await runJevDecide(
-			params,
-			deps({
-				circuit,
-				fetchImpl: jevHttpError(503, "model at capacity"),
-				fallback: async () => {
-					fallbackCalls++;
-					return {
-						text: '{"answers":{"pick":{"type":"choice","choice":"b","confidence":0.6},"level":{"type":"score","score":1},"yesno":{"type":"noul","noul":0.4}}}',
-						model: "mimo/test",
-					};
-				},
-			})
-		);
-		expect(fallbackCalls).toBe(1);
-		expect(out.source).toBe("fallback");
-		expect(out.model).toBe("mimo/test");
-		expect(out.fallbackReason).toContain("503");
-		expect(out.answers.yesno).toEqual({ type: "noul", noul: 0.4 });
-		expect(circuit.isOpen).toBe(true);
-	});
-
-	test("preflight: open circuit skips Jev fetch entirely", async () => {
+	test("preflight: open circuit skips the classifier entirely", async () => {
 		const circuit = new CircuitBreaker(60_000, () => 0);
 		circuit.recordFailure();
-		let fetchCalls = 0;
+		let classifyCalls = 0;
 		const out = await runJevDecide(
 			params,
 			deps({
 				circuit,
-				fetchImpl: async () => {
-					fetchCalls++;
-					return { ok: true, status: 200, text: async () => "", json: async () => ({}) };
+				classify: async () => {
+					classifyCalls++;
+					return { ok: true, model: "typesafe/jev-latest", answers: piAnswers };
 				},
-				fallback: fallbackOk(),
 			})
 		);
-		expect(fetchCalls).toBe(0);
+		expect(classifyCalls).toBe(0);
 		expect(out.source).toBe("fallback");
 		expect(out.fallbackReason).toContain("circuit open");
-	});
-
-	test("missing API key skips Jev and falls back", async () => {
-		let fetchCalls = 0;
-		const out = await runJevDecide(
-			params,
-			deps({
-				apiKey: undefined,
-				fetchImpl: async () => {
-					fetchCalls++;
-					return { ok: true, status: 200, text: async () => "", json: async () => ({}) };
-				},
-				fallback: fallbackOk(),
-			})
-		);
-		expect(fetchCalls).toBe(0);
-		expect(out.fallbackReason).toContain("JEVMODEL_API_KEY");
-	});
-
-	test("non-capacity error throws without fallback", async () => {
-		let fallbackCalls = 0;
-		await expect(
-			runJevDecide(
-				params,
-				deps({
-					fetchImpl: jevHttpError(422, '{"error":"questions must be object"}'),
-					fallback: async () => {
-						fallbackCalls++;
-						return { text: "{}", model: "mimo/test" };
-					},
-				})
-			)
-		).rejects.toThrow("Jev API 422");
-		expect(fallbackCalls).toBe(0);
-	});
-
-	test("network failure falls back", async () => {
-		const circuit = new CircuitBreaker();
-		const out = await runJevDecide(
-			params,
-			deps({
-				circuit,
-				fetchImpl: jevNetworkError(),
-				fallback: fallbackOk(),
-			})
-		);
-		expect(out.source).toBe("fallback");
-		expect(out.fallbackReason).toContain("unreachable");
-		expect(circuit.isOpen).toBe(true);
-	});
-
-	test("abort is rethrown, no fallback, circuit untouched", async () => {
-		const circuit = new CircuitBreaker();
-		const abort = new Error("aborted");
-		abort.name = "AbortError";
-		let fallbackCalls = 0;
-		await expect(
-			runJevDecide(
-				params,
-				deps({
-					circuit,
-					fetchImpl: async () => {
-						throw abort;
-					},
-					fallback: async () => {
-						fallbackCalls++;
-						return { text: "{}", model: "mimo/test" };
-					},
-				})
-			)
-		).rejects.toThrow("aborted");
-		expect(fallbackCalls).toBe(0);
-		expect(circuit.isOpen).toBe(false);
 	});
 
 	test("fallback failure surfaces both causes", async () => {
@@ -458,13 +261,13 @@ describe("runJevDecide", () => {
 			runJevDecide(
 				params,
 				deps({
-					fetchImpl: jevHttpError(429, "rate limited"),
+					classify: classifyDown,
 					fallback: async () => {
 						throw new Error("fallback model offline");
 					},
 				})
 			)
-		).rejects.toThrow(/Jev unavailable \(jev HTTP 429.*\) and fallback failed: fallback model offline/);
+		).rejects.toThrow(/Jev unavailable \(classify down.*\) and fallback failed: fallback model offline/);
 	});
 });
 
@@ -547,83 +350,6 @@ describe("coerceQuestions", () => {
 		["raw array", [1, 2], /got array/],
 	])("rejects %s", (_label, input, expected) => {
 		expect(() => coerceQuestions(input)).toThrow(expected);
-	});
-});
-
-// ---------------------------------------------------------------------------
-// model alias plumbing (params.model was dead code: read as params.modelAlias)
-// ---------------------------------------------------------------------------
-
-describe("model alias", () => {
-	/** Captures the JSON body sent to Jev so we can assert on `model`. */
-	function capturingFetch(seen: string[]): HttpLike {
-		const payload = {
-			model: "jev-1.13.0",
-			answers: validJevAnswers,
-			usage: { input_tokens: 1, output_tokens: 1 },
-		};
-		return (async (_input: unknown, init: { body: string }) => {
-			seen.push(init.body);
-			return {
-				ok: true,
-				status: 200,
-				text: async () => JSON.stringify(payload),
-				json: async () => payload,
-			};
-		}) as unknown as HttpLike;
-	}
-
-	const sentModel = (body: string[]) => JSON.parse(body[0]).model as string;
-
-	test("sends params.model as the request model", async () => {
-		const body: string[] = [];
-		await runJevDecide({ ...params, model: "my-alias" }, deps({ fetchImpl: capturingFetch(body) }));
-		expect(sentModel(body)).toBe("my-alias");
-	});
-
-	test("defaults to jev-latest when no model is given", async () => {
-		const body: string[] = [];
-		await runJevDecide(params, deps({ fetchImpl: capturingFetch(body) }));
-		expect(sentModel(body)).toBe("jev-latest");
-	});
-
-	test("uses deps.modelAlias when params.model is absent", async () => {
-		const body: string[] = [];
-		await runJevDecide(
-			params,
-			deps({ fetchImpl: capturingFetch(body), modelAlias: "alias-from-deps" })
-		);
-		expect(sentModel(body)).toBe("alias-from-deps");
-	});
-
-	test("params.model wins over deps.modelAlias", async () => {
-		const body: string[] = [];
-		await runJevDecide(
-			{ ...params, model: "my-alias" },
-			deps({ fetchImpl: capturingFetch(body), modelAlias: "alias-from-deps" })
-		);
-		expect(sentModel(body)).toBe("my-alias");
-	});
-
-	test("outcome reports the server model when the response includes one", async () => {
-		const out = await runJevDecide(
-			{ ...params, model: "my-alias" },
-			deps({ fetchImpl: jevOk() })
-		);
-		expect(out.model).toBe("jev-1.13.0");
-	});
-
-	test("outcome falls back to params.model when the response omits model", async () => {
-		const out = await runJevDecide(
-			{ ...params, model: "my-alias" },
-			deps({ fetchImpl: jevOk({ model: undefined }) })
-		);
-		expect(out.model).toBe("my-alias");
-	});
-
-	test("outcome falls back to jev-latest when nothing supplies a model", async () => {
-		const out = await runJevDecide(params, deps({ fetchImpl: jevOk({ model: undefined }) }));
-		expect(out.model).toBe("jev-latest");
 	});
 });
 
@@ -766,95 +492,6 @@ describe("ANSWER_LEGEND covers the fields Jev actually returns", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// #4 non-JSON response, #5 request timeout, #6 Jev answer validation
-// ---------------------------------------------------------------------------
-
-/** A fetch that never resolves until its signal aborts. */
-const hangUntilAbort = (async (_url: string, init: { signal?: AbortSignal }) =>
-	new Promise((_resolve, reject) => {
-		const sig = init.signal;
-		if (!sig) return;
-		if (sig.aborted) return reject(sig.reason ?? new Error("aborted"));
-		sig.addEventListener("abort", () => reject(sig.reason ?? new Error("aborted")));
-	})) as unknown as HttpLike;
-
-describe("Jev response handling", () => {
-	test("200 with a non-JSON body raises a clear error, not a parse crash", async () => {
-		const html = (async () => ({
-			ok: true,
-			status: 200,
-			text: async () => "<html><body>502 Bad Gateway</body></html>",
-		})) as unknown as HttpLike;
-		await expect(runJevDecide(params, deps({ fetchImpl: html }))).rejects.toThrow(
-			/non-JSON body/
-		);
-	});
-
-	test("the non-JSON error quotes the offending body so it is debuggable", async () => {
-		const html = (async () => ({
-			ok: true,
-			status: 200,
-			text: async () => "<html><body>502 Bad Gateway</body></html>",
-		})) as unknown as HttpLike;
-		await expect(runJevDecide(params, deps({ fetchImpl: html }))).rejects.toThrow(
-			/502 Bad Gateway/
-		);
-	});
-
-	test("a hung Jev request times out and the main model takes over", async () => {
-		const circuit = new CircuitBreaker();
-		let fallbackCalls = 0;
-		const out = await runJevDecide(
-			params,
-			deps({
-				circuit,
-				fetchImpl: hangUntilAbort,
-				timeoutMs: 30,
-				fallback: async () => {
-					fallbackCalls++;
-					return { text: fullFallbackText, model: "mimo/test" };
-				},
-			})
-		);
-		expect(fallbackCalls).toBe(1);
-		expect(out.source).toBe("fallback");
-		expect(circuit.isOpen).toBe(true);
-	});
-
-	test("the timeout reason is reported to the consumer", async () => {
-		const out = await runJevDecide(
-			params,
-			deps({
-				fetchImpl: hangUntilAbort,
-				timeoutMs: 30,
-				fallback: async () => ({ text: fullFallbackText, model: "mimo/test" }),
-			})
-		);
-		expect(out.fallbackReason).toMatch(/timed out after 30ms/);
-	});
-
-	test("caller abort is rethrown and does NOT trigger the fallback", async () => {
-		const ac = new AbortController();
-		let fallbackCalls = 0;
-		const promise = runJevDecide(
-			params,
-			deps({
-				fetchImpl: hangUntilAbort,
-				signal: ac.signal,
-				timeoutMs: 60_000,
-				fallback: async () => {
-					fallbackCalls++;
-					return { text: fullFallbackText, model: "mimo/test" };
-				},
-			})
-		);
-		ac.abort();
-		await expect(promise).rejects.toThrow();
-		expect(fallbackCalls).toBe(0);
-	});
-});
-
 describe("validateJevAnswers", () => {
 	const good = {
 		pick: { type: "choice", choice: "a", confidence: 0.9, probabilities: { a: 0.9, b: 0.1 } },
@@ -910,18 +547,6 @@ describe("validateJevAnswers", () => {
 		expect(() =>
 			validateJevAnswers({ ...good, yesno: { ...good.yesno, noul: -0.2 } }, questions)
 		).toThrow(/0\.\.1/);
-	});
-
-	test("an invalid Jev answer blocks the request end to end", async () => {
-		const bad = (async () => ({
-			ok: true,
-			status: 200,
-			text: async () =>
-				JSON.stringify({ model: "jev-latest", answers: { pick: { type: "choice", choice: "nope" } } }),
-		})) as unknown as HttpLike;
-		await expect(runJevDecide(params, deps({ fetchImpl: bad }))).rejects.toThrow(
-			/invalid choice/
-		);
 	});
 });
 
@@ -1020,5 +645,268 @@ describe("explainQuestionProblems", () => {
 
 	test("a non-object question is reported, not thrown as a TypeError", () => {
 		expect(explainQuestionProblems({ q: "noul" })[0]).toContain('questions["q"]');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// pi classifier transport: pure mapping helpers
+// ---------------------------------------------------------------------------
+
+/** What pi's classifier answer parser returns for `questions` (noul arrives as bool). */
+const piAnswers = {
+	pick: { type: "choice", choice: "a", confidence: 0.9, probabilities: { a: 0.9, b: 0.1 } },
+	level: { type: "score", score: 1, confidence: 0.7 },
+	yesno: { type: "bool", probability: 0.5 },
+};
+
+describe("toClassifierQuestions", () => {
+	test("choice and score pass through unchanged", () => {
+		const out = toClassifierQuestions({ pick: questions.pick, level: questions.level });
+		expect(out.pick).toEqual({
+			type: "choice",
+			instructions: "pick one",
+			criteria: { a: "first", b: "second" },
+		});
+		expect(out.level).toEqual({
+			type: "score",
+			instructions: "rate",
+			criteria: ["low", "mid", "high"],
+		});
+	});
+
+	test("noul becomes bool, recognizing yes/no labels", () => {
+		const out = toClassifierQuestions({
+			q: { type: "noul", instructions: "is it?", criteria: { yes: "affirmative", no: "negative" } },
+		});
+		expect(out.q).toEqual({
+			type: "bool",
+			instructions: "is it?",
+			criteria: { true: "affirmative", false: "negative" },
+		});
+	});
+
+	test("noul without recognizable labels gets plain branch labels", () => {
+		const bare = toClassifierQuestions({ q: { type: "noul", instructions: "is it?" } });
+		expect((bare.q as { criteria: unknown }).criteria).toEqual({ true: "yes", false: "no" });
+		const odd = toClassifierQuestions({
+			q: { type: "noul", instructions: "x", criteria: { maybe: "idk", whatever: "?" } },
+		});
+		expect((odd.q as { criteria: unknown }).criteria).toEqual({ true: "yes", false: "no" });
+	});
+});
+
+describe("toClassifierState", () => {
+	test("a JSON object passes through untouched", () => {
+		expect(toClassifierState('{"a":1}')).toEqual({ a: 1 });
+	});
+
+	test("plain text is wrapped, never lost", () => {
+		expect(toClassifierState("just words")).toEqual({ text: "just words" });
+	});
+
+	test("JSON that is not an object is wrapped too", () => {
+		expect(toClassifierState("[1,2]")).toEqual({ text: "[1,2]" });
+		expect(toClassifierState('"str"')).toEqual({ text: '"str"' });
+	});
+});
+
+describe("fromClassifierAnswers", () => {
+	test("bool becomes noul carrying the probability", () => {
+		const out = fromClassifierAnswers(piAnswers, questions);
+		expect(out.yesno).toEqual({ type: "noul", noul: 0.5 });
+	});
+
+	test("score regains its legend from the question's own criteria", () => {
+		const out = fromClassifierAnswers(piAnswers, questions);
+		expect(out.level).toEqual({
+			type: "score",
+			score: 1,
+			confidence: 0.7,
+			legend: { 0: "low", 1: "mid", 2: "high" },
+		});
+	});
+
+	test("choice passes through with distribution and confidence", () => {
+		const out = fromClassifierAnswers(piAnswers, questions);
+		expect(out.pick).toEqual(piAnswers.pick);
+	});
+
+	test("a missing answer is omitted so validate names the key", () => {
+		const out = fromClassifierAnswers({ yesno: piAnswers.yesno }, questions);
+		expect(out.pick).toBeUndefined();
+		expect(() => validateJevAnswers(out, questions)).toThrow('omitted answer for question "pick"');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// pi classifier transport: runJevDecide flow
+// ---------------------------------------------------------------------------
+
+const classifySuccess: ClassifyFn = async () => ({
+	ok: true,
+	model: "typesafe/jev-latest",
+	answers: piAnswers,
+	usage: {
+		input: 10,
+		output: 5,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 15,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
+});
+
+/** A classifier that cannot serve right now (auth, capacity, upstream). */
+const classifyDown: ClassifyFn = async () => ({ ok: false, reason: "classify down" });
+
+/** Rejects like a signal-aborted classify call (pi never resolves after abort). */
+function abortRejecting(signal: AbortSignal): Promise<ClassifyOutcome> {
+	return new Promise<ClassifyOutcome>((_, reject) => {
+		const abort = () => {
+			const e = new Error("aborted");
+			e.name = "AbortError";
+			reject(e);
+		};
+		if (signal.aborted) abort();
+		else signal.addEventListener("abort", abort, { once: true });
+	});
+}
+
+describe("runJevDecide via classify transport", () => {
+	test("success: answers mapped onto the jev_decide contract, pi model label, usage", async () => {
+		const circuit = new CircuitBreaker();
+		const out = await runJevDecide(params, deps({ circuit, classify: classifySuccess }));
+		expect(out.source).toBe("jev");
+		expect(out.model).toBe("typesafe/jev-latest");
+		expect(out.answers.yesno).toEqual({ type: "noul", noul: 0.5 });
+		expect(out.answers.level).toEqual({
+			type: "score",
+			score: 1,
+			confidence: 0.7,
+			legend: { 0: "low", 1: "mid", 2: "high" },
+		});
+		expect(out.usage?.totalTokens).toBe(15);
+		expect(circuit.isOpen).toBe(false);
+	});
+
+	test("success without usage leaves usage undefined", async () => {
+		const out = await runJevDecide(
+			params,
+			deps({
+				classify: async () => ({ ok: true, model: "typesafe/jev-latest", answers: piAnswers }),
+			})
+		);
+		expect(out.source).toBe("jev");
+		expect(out.usage).toBeUndefined();
+	});
+
+	test("provider failure falls back, opens the circuit, and the next call skips classify", async () => {
+		const circuit = new CircuitBreaker();
+		let classifyCalls = 0;
+		let fallbackCalls = 0;
+		const failing = async (): Promise<ClassifyOutcome> => {
+			classifyCalls++;
+			return {
+				ok: false,
+				reason: "classify typesafe/jev-latest: No API key for provider: typesafe",
+			};
+		};
+		const handOff = () => {
+			fallbackCalls++;
+			return Promise.resolve({ text: fullFallbackText, model: "mimo/test" });
+		};
+
+		const out = await runJevDecide(params, deps({ circuit, classify: failing, fallback: handOff }));
+		expect(out.source).toBe("fallback");
+		expect(out.fallbackReason).toContain("No API key");
+		expect(classifyCalls).toBe(1);
+		expect(circuit.isOpen).toBe(true);
+
+		await runJevDecide(params, deps({ circuit, classify: failing, fallback: handOff }));
+		expect(classifyCalls).toBe(1); // circuit preflight - no second attempt while open
+		expect(fallbackCalls).toBe(2);
+	});
+
+	test("a stated preflight reason skips the classifier entirely", async () => {
+		let classifyCalls = 0;
+		const out = await runJevDecide(
+			params,
+			deps({
+				fallback: fallbackOk(),
+				preflightReason: "no credentialed classifier model (set TYPESAFE_API_KEY)",
+				classify: async () => {
+					classifyCalls++;
+					return { ok: true, model: "x/y", answers: piAnswers };
+				},
+			})
+		);
+		expect(out.source).toBe("fallback");
+		expect(out.fallbackReason).toBe("no credentialed classifier model (set TYPESAFE_API_KEY)");
+		expect(classifyCalls).toBe(0);
+	});
+
+	test("a hung classifier times out and hands off", async () => {
+		const circuit = new CircuitBreaker();
+		const out = await runJevDecide(
+			params,
+			deps({ circuit, timeoutMs: 5, classify: (_p, signal) => abortRejecting(signal) })
+		);
+		expect(out.source).toBe("fallback");
+		expect(out.fallbackReason).toContain("timed out after 5ms");
+		expect(circuit.isOpen).toBe(true); // a timeout is a capacity failure
+	});
+
+	test("caller abort propagates instead of falling back", async () => {
+		const ac = new AbortController();
+		ac.abort();
+		const circuit = new CircuitBreaker();
+		let fallbackCalls = 0;
+		await expect(
+			runJevDecide(
+				params,
+				deps({
+					signal: ac.signal,
+					circuit,
+					classify: (_p, signal) => abortRejecting(signal),
+					fallback: async () => {
+						fallbackCalls++;
+						return { text: fullFallbackText, model: "mimo/test" };
+					},
+				})
+			)
+		).rejects.toThrow("aborted");
+		expect(fallbackCalls).toBe(0); // cancellation is not a Jev failure
+		expect(circuit.isOpen).toBe(false);
+	});
+
+	test("an unexpected classify throw falls back with the error", async () => {
+		const out = await runJevDecide(
+			params,
+			deps({
+				fallback: fallbackOk(),
+				classify: async () => {
+					throw new TypeError("registry exploded");
+				},
+			})
+		);
+		expect(out.source).toBe("fallback");
+		expect(out.fallbackReason).toContain("classify failed: registry exploded");
+	});
+
+	test("an answer outside the asked criteria fails loudly, never silently", async () => {
+		// pi's parser only checks the answer is a string - a choice not in criteria
+		// must still surface as an error, not reach the consuming model.
+		await expect(
+			runJevDecide(
+				params,
+				deps({
+					classify: async () => ({
+						ok: true,
+						model: "typesafe/jev-latest",
+						answers: { ...piAnswers, pick: { type: "choice", choice: "zzz" } },
+					}),
+				})
+			)
+		).rejects.toThrow("invalid choice");
 	});
 });

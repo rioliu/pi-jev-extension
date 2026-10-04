@@ -1,6 +1,6 @@
 {
   "name": "pi-jev-extension",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Pi extension providing jev_decide: typed choices, scores and yes/no probabilities from TypeSafe's Jev System One model, with automatic session-model fallback.",
   "type": "module",
   "keywords": [
@@ -43,6 +43,8 @@
   },
   "devDependencies": {
     "@types/bun": "^1",
-    "typescript": "^5"
+    "typescript": "^5",
+    "@earendil-works/pi-ai": "1.0.2",
+    "@earendil-works/pi-coding-agent": "1.0.2"
   }
 }
