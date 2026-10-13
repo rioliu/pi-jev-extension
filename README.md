@@ -13,8 +13,11 @@ A [Pi](https://github.com/earendil-works/pi) extension that adds a **`jev_decide
 [TypeSafe](https://typesafe.ai)'s **Jev System One** model a typed question and get back a value your
 code can branch on — a `choice`, a `score`, or a `noul` (yes/no probability). Jev never returns prose.
 
-If Jev is unavailable, rate-limited, out of credit, too slow, or unreachable, the tool **silently hands
-the same question to your session model** instead, and marks the result `source: "fallback"`.
+If a Jev endpoint is unavailable, rate-limited, out of credit, too slow, or unreachable, the tool
+**tries the next branch of its Jev chain** — the [jevmodel.org](https://jevmodel.org) gateway
+first when configured, because the official API is region-blocked from China (see
+[Region-block fallback (China)](#region-block-fallback-china)) — and then **silently hands the
+same question to your session model**, marking the result `source: "fallback"`.
 
 The request goes through **Pi's builtin classifier API**
 (`ctx.modelRegistry.classify`) with your Pi credentials (`TYPESAFE_API_KEY`), so usage
@@ -28,9 +31,9 @@ counts toward the session cost in the footer and `/session`.
 ## Privacy: what leaves your machine
 
 `state` is sent **verbatim** to the endpoint behind the configured classifier credential —
-TypeSafe's System One endpoint with `TYPESAFE_API_KEY`, or whichever Jev-capable provider you
-configured in Pi. Whatever you put in `state` — source code, stack traces, tickets, logs — is
-transmitted to that third-party endpoint.
+TypeSafe's System One endpoint with `TYPESAFE_API_KEY`, and additionally the jevmodel.org gateway
+with `JEVMODEL_API_KEY` when that is configured. Whatever you put in `state` — source code, stack
+traces, tickets, logs — is transmitted to those third-party endpoints.
 
 - Do not call the tool with data your organisation forbids sending off-box to that endpoint.
 - With no classifier credential, no request is made at all: the session model answers directly.
@@ -58,12 +61,41 @@ Pi loads TypeScript directly (no build step).
 | Env var | Required | Default | Purpose |
 |---|---|---|---|
 | `TYPESAFE_API_KEY` | yes* | — | Pi's TypeSafe credential (or configure another Jev-capable provider, e.g. via OpenRouter). *Without any classifier credential the tool falls back to the session model with a stated reason. |
-| `JEVMODEL_TIMEOUT_MS` | no | `30000` | Max wait on Jev before handing off |
+| `JEVMODEL_API_KEY` | no | — | API key for the [jevmodel.org](https://jevmodel.org) gateway (`sk-` key from its dashboard). When set, the extension registers a `jevmodel` provider and puts it **first** in the Jev chain. |
+| `JEVMODEL_BASE_URL` | no | `https://jevmodel.org/v1/` | System One base URL of the gateway (a self-hosted Jev-compatible proxy works too) |
+| `JEVMODEL_TIMEOUT_MS` | no | `30000` | Total wait budget on Jev, split evenly across the chain, before handing off |
 | `JEVMODEL_FALLBACK_MODEL` | no | session model | Pin the fallback to `provider/modelId` |
 
-Model selection: the first credentialed classifier in Pi's registry, preferring
-`typesafe/jev-latest`. The tool's optional `model` argument overrides it as `provider/id`
-(a bare id is taken from `typesafe`, e.g. `jev-latest` or `openrouter/typesafe/jev-1.13`).
+Model selection: by default the tool builds a **chain** of the credentialed Jev classifiers —
+`jevmodel/jev-latest` first when `JEVMODEL_API_KEY` is set (gateway-first is the point for users
+in China, where the official API is blocked), then `typesafe/jev-latest`, then any other
+credentialed Jev classifier — and returns the first answer; if every transport fails the session
+model answers with all the causes. Without `JEVMODEL_API_KEY` the chain starts at
+`typesafe/jev-latest`. The tool's optional `model` argument narrows the chain to that one model
+as `provider/id` (a bare id is taken from `typesafe`, e.g. `jevmodel/jev-latest` or
+`openrouter/typesafe/jev-1.13`).
+
+### Region-block fallback (China)
+
+The official Typesafe API **region-blocks some countries** — requests from China fail with
+HTTP 451 ("not available in your region") or the connection is blackholed entirely.
+[jevmodel.org](https://jevmodel.org) is an independent gateway serving the same System One wire
+format (its own docs: *"swap the base URL and the Bearer key"*), reachable from China behind
+Cloudflare. Set both keys and the chain covers both failure modes:
+
+```bash
+export TYPESAFE_API_KEY=...   # works outside the blocked region, e.g. via VPN egress
+export JEVMODEL_API_KEY=sk-...  # gateway, reachable from China
+```
+
+The gateway answers first, so a call from China never waits on the blocked official endpoint; a
+gateway failure (auth, capacity, its own upstream block) hands off to `typesafe/jev-latest` in the
+same call — useful on a VPN or proxy egress — and a blackholed connection only eats its share of
+the timeout budget (split evenly across the chain). The winning transport is reported in `model`
+(e.g. `jevmodel/jev-latest`). With only `JEVMODEL_API_KEY` set, the gateway is the whole chain.
+> **Note:** the gateway is an unofficial reseller — a trust/availability tradeoff vs. the official
+> API. Get its key at [jevmodel.org/dashboard](https://jevmodel.org/dashboard/) (free tier:
+> 100k input tokens).
 
 ## Asking a question
 
@@ -176,8 +208,9 @@ cheaper than routing through a tool.
 
 | Condition | Behaviour |
 |---|---|
-| Classifier provider error (auth, invalid request, quota, upstream) | fallback + circuit opens — Pi reports these as one `errorMessage`; malformed questions are still rejected before the call, and malformed answers still fail loudly after it |
-| timeout (`JEVMODEL_TIMEOUT_MS`) | fallback + circuit opens |
+| Classifier provider error (auth, invalid request, quota, upstream) | next chain attempt, then fallback + circuit opens — Pi reports these as one `errorMessage`; malformed questions are still rejected before the call, and malformed answers still fail loudly after it |
+| Region-blocked endpoint (HTTP 451 / blackholed connection) | the other chain branch answers in the same call — gateway first (China), then `typesafe/jev-latest` (VPN egress); a blackholed attempt only consumes its share of the timeout budget |
+| timeout (`JEVMODEL_TIMEOUT_MS`, split across the chain) | per-attempt deadline → next chain attempt; exhausted → fallback + circuit opens |
 | no classifier credentials | fallback with a stated preflight reason |
 | malformed `questions` | error **before** any request |
 | malformed answers from the model | error, never silently passed to the consuming model |

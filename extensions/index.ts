@@ -5,10 +5,19 @@
  * (choice / score / noul) and returns structured answers to branch on.
  *
  * Transport: pi's builtin classifier API (ctx.modelRegistry.classify) with a
- * credentialed classifier from the model registry - TYPESAFE_API_KEY by
- * default (typesafe/jev-latest, else the first credentialed classifier). Its
- * usage lands in the session cost (footer and /session). The tool's `model`
- * argument overrides the pick as provider/id (bare id = typesafe).
+ * credentialed classifier from the model registry, chained (the first that
+ * answers wins): jevmodel/jev-latest first when JEVMODEL_API_KEY is set - the
+ * gateway is the primary for users in China, where the official API is
+ * region-blocked - then typesafe/jev-latest, then every other credentialed
+ * Jev classifier. Usage lands in the session cost (footer and /session). The
+ * tool's `model` argument overrides the pick as provider/id (bare id =
+ * typesafe) and narrows the chain to that one model.
+ *
+ * Fallback gateway: the official Typesafe endpoint region-blocks some
+ * countries (HTTP 451, or the connection is blackholed). When JEVMODEL_API_KEY
+ * is set, this extension registers a "jevmodel" provider pointing at the
+ * jevmodel.org gateway (same System One wire format), which joins the chain
+ * after typesafe and before the session-model fallback.
  *
  * Capacity handling: a circuit breaker remembers classifier failures
  * (429/5xx/network/timeout/auth). While open, calls skip Jev and fall back to
@@ -16,8 +25,10 @@
  * itself. Fallback answers are marked with source: "fallback" and a reason.
  *
  * Env: TYPESAFE_API_KEY (classifier provider credential),
+ *      JEVMODEL_API_KEY (jevmodel.org gateway credential; enables the fallback provider),
+ *      JEVMODEL_BASE_URL (gateway System One base URL; default https://jevmodel.org/v1/),
  *      JEVMODEL_FALLBACK_MODEL ("provider/modelId" to pin the fallback model),
- *      JEVMODEL_TIMEOUT_MS (max ms to wait on Jev before handing off; default 30000).
+ *      JEVMODEL_TIMEOUT_MS (total ms to wait on Jev across the chain; default 30000).
  */
 
 import {
@@ -27,15 +38,19 @@ import {
 	type ClassifierModel,
 	type JsonObject,
 } from "@earendil-works/pi-ai";
+import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
 import { defineTool, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 import {
 	buildFallbackMessages,
 	buildToolResult,
+	chainClassify,
 	CircuitBreaker,
 	coerceQuestions,
+	DEFAULT_TIMEOUT_MS,
 	explainQuestionProblems,
 	runJevDecide,
+	orderJevChain,
 	toClassifierQuestions,
 	toClassifierState,
 	type ClassifyFn,
@@ -170,9 +185,10 @@ export const jevTool = defineTool({
 		model: Type.Optional(
 			Type.String({
 				description:
-					"Classifier model as provider/id (a bare id is taken from typesafe), e.g. jev-latest " +
-					"or openrouter/typesafe/jev-1.13; defaults to the first credentialed classifier, " +
-					"preferring typesafe/jev-latest",
+					"Classifier model as provider/id (a bare id is taken from typesafe), e.g. jev-latest, " +
+					"jevmodel/jev-latest or openrouter/typesafe/jev-1.13; defaults to the credentialed " +
+					"Jev classifiers chained - jevmodel/jev-latest first when configured (primary for " +
+					"China), then typesafe/jev-latest. An explicit model narrows the chain to that one model.",
 			})
 		),
 	}),
@@ -186,17 +202,26 @@ export const jevTool = defineTool({
 			questions,
 		};
 
-		// Resolve the classifier model (provider/id override or default).
-		const resolved = await resolveClassifierModel(ctx.modelRegistry, params.model);
+		// Resolve the classifier chain (provider/id override or ordered defaults).
+		const resolved = await resolveClassifierModels(ctx.modelRegistry, params.model);
+		const timeoutMs = resolveTimeoutMs() ?? DEFAULT_TIMEOUT_MS;
 		const transport: TransportDeps =
-			"model" in resolved
-				? { classify: classifyVia(ctx.modelRegistry, resolved.model) }
+			"models" in resolved
+				? {
+						classify: chainClassify(
+							resolved.models.map((m) => ({
+								fn: classifyVia(ctx.modelRegistry, m),
+								label: `${m.provider}/${m.id}`,
+							})),
+							timeoutMs
+						),
+					}
 				: { preflightReason: resolved.preflight };
 		const outcome = await runJevDecide(decideParams, {
 			...transport,
 			signal: signal ?? undefined,
 			circuit,
-			timeoutMs: resolveTimeoutMs(),
+			timeoutMs,
 			fallback: (p) => callFallbackModel(p, ctx, signal ?? undefined),
 		});
 
@@ -222,15 +247,18 @@ export const jevTool = defineTool({
 type TransportDeps = Pick<DeciderDeps, "classify" | "preflightReason">;
 
 /**
- * Pick the classifier model. Default: the first credentialed classifier,
- * preferring typesafe/jev-latest (pi's bundled Jev). An explicit model that
- * exists but has no credentials gets a distinct reason from one that does not
- * exist at all - both arrive in the fallback result the model reads.
+ * Resolve the ordered classifier chain via orderJevChain(): jevmodel/jev-latest
+ * first when JEVMODEL_API_KEY is set (the gateway is reachable from China,
+ * the official endpoint is not), then typesafe/jev-latest, then every other
+ * credentialed Jev classifier. An explicit `model` argument narrows the chain
+ * to exactly that one model. An explicit model that exists but has no
+ * credentials gets a distinct reason from one that does not exist at all -
+ * both arrive in the fallback result the model reads.
  */
-async function resolveClassifierModel(
+async function resolveClassifierModels(
 	registry: ModelRegistry,
 	requested: string | undefined
-): Promise<{ model: ClassifierModel<ClassifierApi> } | { preflight: string }> {
+): Promise<{ models: ClassifierModel<ClassifierApi>[] } | { preflight: string }> {
 	// Old pi hosts (< 1.0) have no classifier API: degrade, do not crash.
 	if (typeof registry.getAvailableOfType !== "function") {
 		return {
@@ -256,17 +284,20 @@ async function resolveClassifierModel(
 				preflight: `classifier model "${requested}" has no credentials (check ${provider} auth)`,
 			};
 		}
-		return { model: found };
+		return { models: [found] };
 	}
-	const preferred =
-		available.find((m) => m.provider === "typesafe" && m.id === "jev-latest") ?? available[0];
-	if (!preferred) {
+	// Default chain: orderJevChain() puts the jevmodel.org gateway first when
+	// configured (primary for users in China), then typesafe, then the other
+	// Jev branches. Chain order is attempt order - a region-blocked or hung
+	// primary cannot starve the rest.
+	const ordered = orderJevChain(available);
+	if (ordered.length === 0) {
 		return {
 			preflight:
-				"no credentialed classifier model (set TYPESAFE_API_KEY, or configure another Jev provider)",
+				"no credentialed classifier model (set JEVMODEL_API_KEY or TYPESAFE_API_KEY, or configure another Jev provider)",
 		};
 	}
-	return { model: preferred };
+	return { models: ordered };
 }
 
 /**
@@ -396,6 +427,47 @@ function resolveTimeoutMs(): number | undefined {
 	return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+/** Provider id under which the jevmodel.org gateway registers its classifier. */
+const JEVMODEL_PROVIDER = "jevmodel";
+
+/** jevmodel.org's System One base URL (the transport appends "systemone"). */
+const JEVMODEL_DEFAULT_BASE_URL = "https://jevmodel.org/v1/";
+
+/**
+ * Register the jevmodel.org gateway as a Jev-capable classifier provider when
+ * JEVMODEL_API_KEY is set. It serves the same System One wire format as
+ * TypeSafe - "swap the base URL and the Bearer key" per its own docs - so the
+ * transport (pi-ai's typesafe-system-one classifier) is reused as-is. The
+ * model then appears as jevmodel/jev-latest in the registry and joins the
+ * default classify chain after typesafe, which is what keeps Jev reachable
+ * from behind the Typesafe region block (HTTP 451 / blackholed connections).
+ */
+function registerJevmodelProvider(pi: ExtensionAPI): void {
+	if (!process.env.JEVMODEL_API_KEY) return;
+	const raw = process.env.JEVMODEL_BASE_URL?.trim() || JEVMODEL_DEFAULT_BASE_URL;
+	const baseUrl = raw.endsWith("/") ? raw : `${raw}/`;
+	pi.registerProvider(JEVMODEL_PROVIDER, {
+		name: "jevmodel.org",
+		baseUrl,
+		apiKey: "$JEVMODEL_API_KEY",
+		api: "typesafe-system-one",
+		classifiers: { "typesafe-system-one": typesafeSystemOneApi() },
+		models: [
+			{
+				type: "classifier",
+				id: "jev-latest",
+				name: "Jev (jevmodel.org)",
+				api: "typesafe-system-one",
+				input: ["text"],
+				// jevmodel.org pricing: $0.042 / 1M input tokens, output free.
+				cost: { input: 0.042, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 64_000,
+			},
+		],
+	});
+}
+
 export default function (pi: ExtensionAPI) {
+	registerJevmodelProvider(pi);
 	pi.registerTool(jevTool);
 }
