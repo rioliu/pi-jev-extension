@@ -6,6 +6,7 @@ import {
 	buildToolResult,
 	chainClassify,
 	CircuitBreaker,
+	classifySystemOneHttp,
 	coerceQuestions,
 	explainQuestionProblems,
 	extractJsonObject,
@@ -13,6 +14,7 @@ import {
 	normalizeAnswers,
 	orderJevChain,
 	runJevDecide,
+	SystemOneFetch,
 	toClassifierQuestions,
 	toClassifierState,
 	toFullUsage,
@@ -1091,5 +1093,168 @@ describe("orderJevChain", () => {
 		const model = { ...jevmodel, contextWindow: 64_000 };
 		const out = orderJevChain([typesafe, model]);
 		expect(out[0]).toBe(model);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// gateway transport: System One over fetch (self-contained on purpose)
+// ---------------------------------------------------------------------------
+
+describe("classifySystemOneHttp", () => {
+	const model = {
+		provider: "jevmodel",
+		id: "jev-latest",
+		baseUrl: "https://jevmodel.org/v1/",
+		cost: { input: 0.042, output: 0 },
+	};
+	const context = {
+		state: { text: "some state" },
+		questions: {
+			pick: { type: "choice", instructions: "pick one", criteria: { a: "first", b: "second" } },
+			level: { type: "score", instructions: "rate", criteria: ["low", "mid", "high"] },
+			yesno: { type: "bool", instructions: "is it?", criteria: { true: "yes", false: "no" } },
+		},
+	};
+
+	/** fetch stub capturing the request and replaying a fixed response. */
+	function fakeFetch(body: unknown, status = 200) {
+		const seen: { url?: string; init?: RequestInit } = {};
+		const fn = (async (url: unknown, init?: RequestInit) => {
+			seen.url = String(url);
+			seen.init = init;
+			return new Response(JSON.stringify(body), {
+				status,
+				headers: { "content-type": "application/json" },
+			});
+		}) as SystemOneFetch;
+		return { fn, seen };
+	}
+
+	const goodBody = {
+		answers: {
+			pick: { type: "choice", choice: "a", probabilities: { a: 0.9, b: 0.1 }, confidence: 0.8 },
+			level: { type: "score", score: 1.5, confidence: 0.7 },
+			yesno: { type: "noul", noul: 0.6 },
+		},
+		usage: { input_tokens: 1000, output_tokens: 5 },
+	};
+
+	test("posts the System One wire format with Bearer auth and bool renamed to noul", async () => {
+		const { fn, seen } = fakeFetch(goodBody);
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-test" }, { fetchFn: fn });
+		expect(out.ok).toBe(true);
+		expect(seen.url).toBe("https://jevmodel.org/v1/systemone");
+		const init = seen.init as RequestInit;
+		expect(init.method).toBe("POST");
+		expect((init.headers as Record<string, string>).authorization).toBe("Bearer sk-test");
+		const payload = JSON.parse(String(init.body));
+		expect(payload.model).toBe("jev-latest");
+		expect(payload.state).toEqual({ text: "some state" });
+		expect(payload.questions.yesno.type).toBe("noul"); // wire-level name
+		expect(payload.questions.pick.type).toBe("choice");
+	});
+
+	test("parses answers into the classifier shape and prices the usage", async () => {
+		const { fn } = fakeFetch(goodBody);
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-test" }, { fetchFn: fn });
+		if (!out.ok) throw new Error(out.reason);
+		expect(out.answers.pick).toEqual({
+			type: "choice",
+			choice: "a",
+			probabilities: { a: 0.9, b: 0.1 },
+			confidence: 0.8,
+		});
+		expect(out.answers.level).toEqual({ type: "score", score: 1.5, confidence: 0.7 });
+		expect(out.answers.yesno).toEqual({ type: "bool", probability: 0.6 });
+		expect(out.usage).toEqual({
+			input: 1000,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 1005,
+			cost: { input: 0.042 / 1000, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.042 / 1000 },
+		});
+	});
+
+	test("a baseUrl without a trailing slash is normalized", async () => {
+		const { fn, seen } = fakeFetch(goodBody);
+		await classifySystemOneHttp(
+			{ ...model, baseUrl: "https://mirror.example.com/v1" },
+			context,
+			{ apiKey: "sk-test" },
+			{ fetchFn: fn }
+		);
+		expect(seen.url).toBe("https://mirror.example.com/v1/systemone");
+	});
+
+	test("HTTP error becomes a stated reason carrying status and body", async () => {
+		const { fn } = fakeFetch(
+			{ error: { type: "authentication_error", message: "Invalid or disabled API key." } },
+			401
+		);
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-bad" }, { fetchFn: fn });
+		expect(out.ok).toBe(false);
+		if (!out.ok) {
+			expect(out.reason).toContain("System One API error (401)");
+			expect(out.reason).toContain("Invalid or disabled API key");
+		}
+	});
+
+	test("a missing key is a stated reason, never a request", async () => {
+		let calls = 0;
+		const fn = (async () => {
+			calls++;
+			return new Response("{}");
+		}) as SystemOneFetch;
+		const out = await classifySystemOneHttp(model, context, { apiKey: undefined }, { fetchFn: fn });
+		expect(out.ok).toBe(false);
+		if (!out.ok) expect(out.reason).toContain("No API key");
+		expect(calls).toBe(0);
+	});
+
+	test("network failure becomes a stated reason", async () => {
+		const fn = (async () => {
+			throw new TypeError("fetch failed");
+		}) as SystemOneFetch;
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-test" }, { fetchFn: fn });
+		expect(out.ok).toBe(false);
+		if (!out.ok) expect(out.reason).toContain("System One request failed: fetch failed");
+	});
+
+	test("an aborted signal throws AbortError so the chain can dispatch it", async () => {
+		const ac = new AbortController();
+		ac.abort();
+		await expect(
+			classifySystemOneHttp(model, context, { apiKey: "sk-test", signal: ac.signal })
+		).rejects.toMatchObject({ name: "AbortError" });
+	});
+
+	test("a missing answer fails loudly naming the question key", async () => {
+		const { fn } = fakeFetch({ answers: { pick: goodBody.answers.pick, level: goodBody.answers.level } });
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-test" }, { fetchFn: fn });
+		expect(out.ok).toBe(false);
+		if (!out.ok) expect(out.reason).toContain('"yesno"');
+	});
+
+	test("malformed answer content fails loudly, never silently", async () => {
+		const body = { ...goodBody, answers: { ...goodBody.answers, yesno: { type: "noul", noul: "high" } } };
+		const { fn } = fakeFetch(body);
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-test" }, { fetchFn: fn });
+		expect(out.ok).toBe(false);
+		if (!out.ok) expect(out.reason).toContain('invalid noul for "yesno"');
+	});
+
+	test("a response without usage leaves usage undefined", async () => {
+		const { fn } = fakeFetch({ answers: goodBody.answers });
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-test" }, { fetchFn: fn });
+		if (!out.ok) throw new Error(out.reason);
+		expect(out.usage).toBeUndefined();
+	});
+
+	test("a non-JSON response becomes a stated reason", async () => {
+		const fn = (async () => new Response("<html>gateway maintenance</html>", { status: 200 })) as SystemOneFetch;
+		const out = await classifySystemOneHttp(model, context, { apiKey: "sk-test" }, { fetchFn: fn });
+		expect(out.ok).toBe(false);
+		if (!out.ok) expect(out.reason).toContain("non-JSON");
 	});
 });

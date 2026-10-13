@@ -225,7 +225,15 @@ bun install          # peer deps: @earendil-works/pi-ai, pi-coding-agent
 bun test             # unit tests
 bun run extensions/schema-check.ts   # schema + prompt-definition integrity
 bun run typecheck
+bun run check:load   # load the extension through pi's real jiti alias map
 ```
+
+`check:load` reproduces how pi actually loads an installed extension: jiti with pi's fixed alias
+map (the pi-ai root resolves to `dist/compat.js`; `api/*` subpaths do not resolve at all, and an
+installed extension has no `node_modules` next to it). Imports that typecheck and pass CI through
+the dev `node_modules` but would break user startup fail here instead — 0.3.0 shipped exactly that
+bug. Keep extension imports inside the aliased roots: `@earendil-works/pi-ai`,
+`@earendil-works/pi-coding-agent`, and pi-ai's `/compat`, `/oauth`, `/providers/all` subpaths.
 
 Typecheck pins `@earendil-works/pi-ai` and `pi-coding-agent` at 1.0.2 as devDependencies - the
 classifier types (`ClassifierModel`, `ctx.modelRegistry.classify`) do not exist in older releases.

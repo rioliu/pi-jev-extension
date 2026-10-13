@@ -27,3 +27,6 @@ jobs:
 
       - name: Typecheck
         run: bun run typecheck
+
+      - name: Runtime load check (pi jiti alias map)
+        run: bun run check:load
