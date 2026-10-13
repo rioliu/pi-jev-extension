@@ -386,6 +386,101 @@ export type ClassifyOutcome =
 /** One classifier call; receives the same combined signal a fetch would. */
 export type ClassifyFn = (params: DecideParams, signal: AbortSignal) => Promise<ClassifyOutcome>;
 
+/** One transport in a classify chain: the call plus the label used in reasons. */
+export interface ClassifyAttempt {
+	fn: ClassifyFn;
+	/** Provider/id label, used in timeout and aggregated failure reasons. */
+	label: string;
+}
+
+function abortedError(): Error {
+	const e = new Error("classify aborted");
+	e.name = "AbortError";
+	return e;
+}
+
+/** Rejects with an AbortError when the signal aborts (never resolves otherwise). */
+function abortRejection(signal: AbortSignal): Promise<never> {
+	return new Promise((_, reject) => {
+		const onAbort = () => reject(abortedError());
+		if (signal.aborted) onAbort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+/** Minimal classifier identity the chain ordering needs. */
+export interface ClassifierRef {
+	provider: string;
+	id: string;
+}
+
+/**
+ * Order credentialed classifiers into the default attempt chain (returns the
+ * same object references, so opaque registry models pass through untouched):
+ *
+ * 1. jevmodel/jev-latest - when the gateway is configured (JEVMODEL_API_KEY)
+ *    it goes FIRST: users in China cannot reach the official endpoint at all
+ *    (HTTP 451 / blackholed connections), and keying the gateway signals that
+ *    intent. A failing gateway still hands off to typesafe in the same call.
+ * 2. typesafe/jev-latest (pi's bundled Jev), then every other credentialed
+ *    Jev classifier (an OpenRouter Jev, ...).
+ * 3. No Jev classifier at all: the first credentialed classifier, preserving
+ *    the historic default. Empty input yields an empty chain (index.ts turns
+ *    that into a preflight reason).
+ */
+export function orderJevChain<T extends ClassifierRef>(available: readonly T[]): T[] {
+	const jevModels = available.filter((m) => m.id.includes("jev"));
+	const jevmodel = available.find((m) => m.provider === "jevmodel" && m.id === "jev-latest");
+	const typesafe = available.find((m) => m.provider === "typesafe" && m.id === "jev-latest");
+	const primary = jevmodel ?? typesafe ?? jevModels[0] ?? available[0];
+	if (!primary) return [];
+	return [primary, ...jevModels.filter((m) => m !== primary)];
+}
+
+/**
+ * Try each transport in order and return the first success.
+ *
+ * Added for region blocks: the official endpoint can answer 451 or blackhole
+ * the connection entirely (GFW-style), so a fallback Jev gateway (the
+ * jevmodel.org provider registered in index.ts) must still get its turn. The
+ * total budget is split evenly across attempts, so a hung primary consumes
+ * only its share and cannot starve a reachable fallback. Transports that
+ * ignore the abort signal are raced against the deadline, not awaited.
+ *
+ * Every attempt failing yields one aggregated reason (each transport's own
+ * cause, joined with "; ") so the session-model fallback can state exactly why
+ * no Jev answered. Caller abort - or the outer runJevDecide deadline - stops
+ * the chain and propagates: that is cancellation, not a Jev failure.
+ */
+export function chainClassify(attempts: ClassifyAttempt[], timeoutMs: number): ClassifyFn {
+	if (attempts.length === 0) {
+		throw new Error("chainClassify: no attempts configured");
+	}
+	const perAttemptMs = Math.max(1, Math.floor(timeoutMs / attempts.length));
+	return async (params, requestSignal) => {
+		const reasons: string[] = [];
+		for (const { fn, label } of attempts) {
+			if (requestSignal.aborted) throw abortedError();
+			const attemptSignal = combineSignals(requestSignal, timeoutSignalOf(perAttemptMs));
+			let res: ClassifyOutcome;
+			try {
+				res = await Promise.race([fn(params, attemptSignal), abortRejection(attemptSignal)]);
+			} catch (e) {
+				if (requestSignal.aborted) throw e; // caller or outer deadline
+				reasons.push(
+					attemptSignal.aborted
+						? `${label} timed out after ${perAttemptMs}ms`
+						: `${label} failed: ${e instanceof Error ? e.message : String(e)}`
+				);
+				continue;
+			}
+			if (res.ok) return res;
+			reasons.push(res.reason);
+		}
+		return { ok: false, reason: reasons.join("; ") };
+	};
+}
+
 /** Structural twin of pi's ClassifierQuestion - lib.ts stays pi-import-free. */
 export type ClassifierQuestionShape =
 	| { type: "choice"; instructions: string; criteria: Record<string, string> }

@@ -4,12 +4,14 @@ import {
 	ANSWER_LEGEND,
 	buildFallbackMessages,
 	buildToolResult,
+	chainClassify,
 	CircuitBreaker,
 	coerceQuestions,
 	explainQuestionProblems,
 	extractJsonObject,
 	fromClassifierAnswers,
 	normalizeAnswers,
+	orderJevChain,
 	runJevDecide,
 	toClassifierQuestions,
 	toClassifierState,
@@ -908,5 +910,186 @@ describe("runJevDecide via classify transport", () => {
 				})
 			)
 		).rejects.toThrow("invalid choice");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// classify chain: primary + fallback Jev gateway (e.g. jevmodel.org)
+// ---------------------------------------------------------------------------
+
+describe("chainClassify", () => {
+	const okAttempt = (model: string): ClassifyFn => async () => ({
+		ok: true,
+		model,
+		answers: piAnswers,
+	});
+	const failAttempt = (reason: string): ClassifyFn => async () => ({ ok: false, reason });
+	/** Never settles and ignores the abort signal - the worst-case transport. */
+	const hangAttempt = (): ClassifyFn => () => new Promise<ClassifyOutcome>(() => {});
+
+	test("first success wins; later attempts are never called", async () => {
+		let secondCalls = 0;
+		const chain = chainClassify(
+			[
+				{ fn: okAttempt("typesafe/jev-latest"), label: "typesafe/jev-latest" },
+				{
+					fn: async () => {
+						secondCalls++;
+						return { ok: true, model: "jevmodel/jev-latest", answers: piAnswers };
+					},
+					label: "jevmodel/jev-latest",
+				},
+			],
+			30_000
+		);
+		const res = await chain(params, new AbortController().signal);
+		expect(res.ok).toBe(true);
+		if (res.ok) expect(res.model).toBe("typesafe/jev-latest");
+		expect(secondCalls).toBe(0);
+	});
+
+	test("a failed primary falls through to the fallback gateway", async () => {
+		const chain = chainClassify(
+			[
+				{ fn: failAttempt("classify typesafe/jev-latest: 451 not available in your region"), label: "typesafe/jev-latest" },
+				{ fn: okAttempt("jevmodel/jev-latest"), label: "jevmodel/jev-latest" },
+			],
+			30_000
+		);
+		const res = await chain(params, new AbortController().signal);
+		expect(res.ok).toBe(true);
+		if (res.ok) expect(res.model).toBe("jevmodel/jev-latest");
+	});
+
+	test("all attempts failing yields one reason naming every cause", async () => {
+		const chain = chainClassify(
+			[
+				{ fn: failAttempt("classify typesafe/jev-latest: 451 region blocked"), label: "typesafe/jev-latest" },
+				{ fn: failAttempt("classify jevmodel/jev-latest: 401 missing key"), label: "jevmodel/jev-latest" },
+			],
+			30_000
+		);
+		const res = await chain(params, new AbortController().signal);
+		expect(res.ok).toBe(false);
+		if (!res.ok) {
+			expect(res.reason).toContain("451 region blocked");
+			expect(res.reason).toContain("401 missing key");
+		}
+	});
+
+	test("a hung primary cannot starve the fallback: per-attempt deadline", async () => {
+		const chain = chainClassify(
+			[
+				{ fn: hangAttempt(), label: "typesafe/jev-latest" },
+				{ fn: okAttempt("jevmodel/jev-latest"), label: "jevmodel/jev-latest" },
+			],
+			40 // 20ms per attempt with two attempts
+		);
+		const started = Date.now();
+		const res = await chain(params, new AbortController().signal);
+		expect(res.ok).toBe(true);
+		if (res.ok) expect(res.model).toBe("jevmodel/jev-latest");
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
+
+	test("a hung primary plus a failing fallback reports the timeout", async () => {
+		const chain = chainClassify(
+			[
+				{ fn: hangAttempt(), label: "typesafe/jev-latest" },
+				{ fn: failAttempt("classify jevmodel/jev-latest: 503 capacity"), label: "jevmodel/jev-latest" },
+			],
+			40
+		);
+		const res = await chain(params, new AbortController().signal);
+		expect(res.ok).toBe(false);
+		if (!res.ok) {
+			expect(res.reason).toContain("typesafe/jev-latest timed out after 20ms");
+			expect(res.reason).toContain("503 capacity");
+		}
+	});
+
+	test("a transport that ignores the abort signal still yields to the deadline", async () => {
+		const chain = chainClassify(
+			[
+				{ fn: hangAttempt(), label: "stubborn" }, // never looks at the signal
+				{ fn: okAttempt("jevmodel/jev-latest"), label: "jevmodel/jev-latest" },
+			],
+			20
+		);
+		const res = await chain(params, new AbortController().signal);
+		expect(res.ok).toBe(true);
+	});
+
+	test("caller abort stops the chain and propagates without attempts", async () => {
+		const ac = new AbortController();
+		ac.abort();
+		let calls = 0;
+		const chain = chainClassify(
+			[
+				{
+					fn: async () => {
+						calls++;
+						return { ok: true, model: "x/y", answers: piAnswers };
+					},
+					label: "x/y",
+				},
+			],
+			30_000
+		);
+		await expect(chain(params, ac.signal)).rejects.toThrow("aborted");
+		expect(calls).toBe(0);
+	});
+
+	test("an empty chain is a wiring bug, not a runtime condition", () => {
+		expect(() => chainClassify([], 30_000)).toThrow("no attempts");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// default chain ordering (gateway-first for Chinese users)
+// ---------------------------------------------------------------------------
+
+describe("orderJevChain", () => {
+	const ref = (provider: string, id: string) => ({ provider, id });
+	const typesafe = ref("typesafe", "jev-latest");
+	const jevmodel = ref("jevmodel", "jev-latest");
+	const openrouter = ref("openrouter", "typesafe/jev-1.13");
+
+	test("gateway configured: jevmodel first, typesafe next, then other branches", () => {
+		const out = orderJevChain([typesafe, jevmodel, openrouter]);
+		expect(out).toEqual([jevmodel, typesafe, openrouter]);
+	});
+
+	test("without the gateway key: typesafe first, then other Jev branches", () => {
+		const out = orderJevChain([typesafe, openrouter]);
+		expect(out).toEqual([typesafe, openrouter]);
+	});
+
+	test("gateway only (China user, no TYPESAFE_API_KEY)", () => {
+		expect(orderJevChain([jevmodel])).toEqual([jevmodel]);
+	});
+
+	test("no typesafe, no gateway: first credentialed Jev classifier", () => {
+		expect(orderJevChain([openrouter])).toEqual([openrouter]);
+	});
+
+	test("no Jev classifier at all keeps the historic single default", () => {
+		const other = ref("cloudflare-workers-ai", "some-classifier");
+		expect(orderJevChain([other])).toEqual([other]);
+	});
+
+	test("non-Jev classifiers never join behind a Jev primary", () => {
+		const other = ref("cloudflare-workers-ai", "some-classifier");
+		expect(orderJevChain([other, typesafe, jevmodel])).toEqual([jevmodel, typesafe]);
+	});
+
+	test("nothing credentialed returns an empty chain (preflight in index.ts)", () => {
+		expect(orderJevChain([])).toEqual([]);
+	});
+
+	test("returns the same object references (registry models are opaque)", () => {
+		const model = { ...jevmodel, contextWindow: 64_000 };
+		const out = orderJevChain([typesafe, model]);
+		expect(out[0]).toBe(model);
 	});
 });
