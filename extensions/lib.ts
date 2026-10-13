@@ -437,6 +437,193 @@ export function orderJevChain<T extends ClassifierRef>(available: readonly T[]):
 	return [primary, ...jevModels.filter((m) => m !== primary)];
 }
 
+// ---------------------------------------------------------------------------
+// Gateway transport: System One over fetch (self-contained on purpose)
+// ---------------------------------------------------------------------------
+
+export interface SystemOneTransportModel {
+	provider: string;
+	id: string;
+	/** System One base URL; a missing trailing slash is normalized. */
+	baseUrl: string;
+	/** Per-million-token rates, e.g. { input: 0.042, output: 0 }. */
+	cost: { input: number; output: number };
+}
+
+export type SystemOneHttpOutcome =
+	| { ok: true; answers: Record<string, unknown>; usage?: FullUsage }
+	| { ok: false; reason: string };
+
+/** Structural fetch signature - assignable from globalThis.fetch, easy to fake in tests. */
+export type SystemOneFetch = (url: URL, init?: RequestInit) => Promise<Response>;
+
+function isPlainRecord(v: unknown): v is Record<string, unknown> {
+	return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Map the response's answers onto pi's classifier answer shape: noul -> bool
+ * (the public question name this tool speaks) with choice and score passing
+ * through with their distribution and confidence. Strict like pi-ai's own
+ * parser: a malformed answer fails loudly here, it never reaches the consumer.
+ */
+function parseSystemOneAnswers(
+	label: string,
+	raw: unknown,
+	questions: Record<string, unknown>
+): { ok: true; answers: Record<string, unknown> } | { ok: false; reason: string } {
+	if (!isPlainRecord(raw)) {
+		return { ok: false, reason: `${label} returned an unexpected response (no answers)` };
+	}
+	const out: Record<string, unknown> = {};
+	for (const [key, rawQuestion] of Object.entries(questions)) {
+		const q = isPlainRecord(rawQuestion) ? rawQuestion : {};
+		const a = raw[key];
+		if (!isPlainRecord(a)) {
+			return { ok: false, reason: `${label} did not return an answer for "${key}"` };
+		}
+		if (q.type === "choice") {
+			const probs = isPlainRecord(a.probabilities) ? a.probabilities : undefined;
+			if (
+				a.type !== "choice" ||
+				typeof a.choice !== "string" ||
+				probs === undefined ||
+				typeof a.confidence !== "number" ||
+				!Number.isFinite(a.confidence)
+			) {
+				return { ok: false, reason: `${label} returned a malformed choice answer for "${key}"` };
+			}
+			const probabilities: Record<string, number> = {};
+			for (const [opt, v] of Object.entries(probs)) {
+				if (typeof v !== "number" || !Number.isFinite(v)) {
+					return {
+						ok: false,
+						reason: `${label} returned an invalid probability for "${key}.${opt}"`,
+					};
+				}
+				probabilities[opt] = v;
+			}
+			out[key] = { type: "choice", choice: a.choice, probabilities, confidence: a.confidence };
+		} else if (q.type === "score") {
+			if (
+				a.type !== "score" ||
+				typeof a.score !== "number" ||
+				!Number.isFinite(a.score) ||
+				typeof a.confidence !== "number" ||
+				!Number.isFinite(a.confidence)
+			) {
+				return { ok: false, reason: `${label} returned a malformed score answer for "${key}"` };
+			}
+			out[key] = { type: "score", score: a.score, confidence: a.confidence };
+		} else {
+			if (a.type !== "noul" || typeof a.noul !== "number" || !Number.isFinite(a.noul)) {
+				return { ok: false, reason: `${label} returned an invalid noul for "${key}"` };
+			}
+			out[key] = { type: "bool", probability: a.noul };
+		}
+	}
+	return { ok: true, answers: out };
+}
+
+/** System One's `{ input_tokens, output_tokens }` priced from the model rates. */
+function parseSystemOneUsage(
+	raw: unknown,
+	costRates: SystemOneTransportModel["cost"]
+): FullUsage | undefined {
+	if (!isPlainRecord(raw)) return undefined;
+	const count = (v: unknown) =>
+		typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+	const input = count(raw.input_tokens);
+	const output = count(raw.output_tokens);
+	if (input === 0 && output === 0 && raw.input_tokens === undefined && raw.output_tokens === undefined) {
+		return undefined;
+	}
+	const costInput = (costRates.input / 1_000_000) * input;
+	const costOutput = (costRates.output / 1_000_000) * output;
+	return {
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: input + output,
+		cost: {
+			input: costInput,
+			output: costOutput,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: costInput + costOutput,
+		},
+	};
+}
+
+/**
+ * Minimal System One client for the jevmodel.org gateway (and any compatible
+ * endpoint). Self-contained on purpose: pi only aliases the pi-ai ROOT into
+ * installed extensions (jiti's alias map, root mapped to dist/compat.js) -
+ * its api/* subpaths do not resolve there, and importing one broke extension
+ * loading in 0.3.0. The wire protocol mirrors pi-ai's typesafe-system-one
+ * transport: POST {baseUrl}/systemone, Bearer key, bool questions renamed to
+ * noul on the wire and back to bool in the answers. HTTP failures return a
+ * stated reason - the classify chain and circuit breaker own retries.
+ */
+export async function classifySystemOneHttp(
+	model: SystemOneTransportModel,
+	context: { state: Record<string, unknown>; questions: Record<string, unknown> },
+	options: { apiKey: string | undefined; signal?: AbortSignal },
+	deps: { fetchFn?: SystemOneFetch } = {}
+): Promise<SystemOneHttpOutcome> {
+	const label = "System One API";
+	if (!options.apiKey) {
+		return { ok: false, reason: `No API key for provider: ${model.provider}` };
+	}
+	if (options.signal?.aborted) throw abortedError();
+
+	const url = new URL("systemone", `${model.baseUrl.replace(/\/+$/u, "")}/`);
+	const payload = {
+		model: model.id,
+		state: context.state,
+		questions: Object.fromEntries(
+			Object.entries(context.questions).map(([key, q]) => [
+				key,
+				isPlainRecord(q) && q.type === "bool" ? { ...q, type: "noul" } : q,
+			])
+		),
+	};
+
+	let response: Response;
+	try {
+		response = await (deps.fetchFn ?? globalThis.fetch)(url, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${options.apiKey}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify(payload),
+			signal: options.signal,
+		});
+	} catch (e) {
+		if (options.signal?.aborted) throw abortedError();
+		return { ok: false, reason: `System One request failed: ${e instanceof Error ? e.message : String(e)}` };
+	}
+	if (!response.ok) {
+		const body = await response.text().catch(() => "");
+		return { ok: false, reason: `${label} error (${response.status}): ${body.slice(0, 300)}` };
+	}
+	let parsed: unknown;
+	try {
+		parsed = await response.json();
+	} catch {
+		return { ok: false, reason: `${label} returned a non-JSON response` };
+	}
+	if (!isPlainRecord(parsed)) {
+		return { ok: false, reason: `${label} returned an unexpected response` };
+	}
+	const answers = parseSystemOneAnswers(label, parsed.answers, context.questions);
+	if (!answers.ok) return answers;
+	const usage = parseSystemOneUsage(parsed.usage, model.cost);
+	return { ok: true, answers: answers.answers, ...(usage ? { usage } : {}) };
+}
+
 /**
  * Try each transport in order and return the first success.
  *

@@ -37,8 +37,9 @@ import {
 	type ClassifierApi,
 	type ClassifierModel,
 	type JsonObject,
+	type ProviderClassifier,
+	type ClassifierResult,
 } from "@earendil-works/pi-ai";
-import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
 import { defineTool, type ExtensionAPI, type ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -46,6 +47,7 @@ import {
 	buildToolResult,
 	chainClassify,
 	CircuitBreaker,
+	classifySystemOneHttp,
 	coerceQuestions,
 	DEFAULT_TIMEOUT_MS,
 	explainQuestionProblems,
@@ -434,13 +436,53 @@ const JEVMODEL_PROVIDER = "jevmodel";
 const JEVMODEL_DEFAULT_BASE_URL = "https://jevmodel.org/v1/";
 
 /**
+ * System One classifier implementation for the jevmodel provider.
+ *
+ * Implemented inside the extension instead of importing pi-ai's
+ * typesafe-system-one module because pi only aliases the pi-ai ROOT into
+ * installed extensions (mapped to dist/compat.js) - api/* subpaths do not
+ * resolve there, and importing one broke extension loading in 0.3.0. The
+ * wire protocol is identical; the parsing lives in lib.ts where it is unit
+ * tested with an injected fetch.
+ */
+const jevmodelClassifier: ProviderClassifier = {
+	async classify(model, context, options) {
+		const base = {
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: Date.now(),
+		};
+		const out = await classifySystemOneHttp(
+			{
+				provider: model.provider,
+				id: model.id,
+				baseUrl: model.baseUrl,
+				cost: { input: model.cost.input, output: model.cost.output },
+			},
+			context as unknown as { state: Record<string, unknown>; questions: Record<string, unknown> },
+			{ apiKey: options?.apiKey, signal: options?.signal }
+		);
+		if (out.ok) {
+			return {
+				...base,
+				answers: out.answers as unknown as ClassifierResult["answers"],
+				stopReason: "stop",
+				usage: out.usage,
+			};
+		}
+		return { ...base, answers: {}, stopReason: "error", errorMessage: out.reason };
+	},
+};
+
+/**
  * Register the jevmodel.org gateway as a Jev-capable classifier provider when
  * JEVMODEL_API_KEY is set. It serves the same System One wire format as
  * TypeSafe - "swap the base URL and the Bearer key" per its own docs - so the
- * transport (pi-ai's typesafe-system-one classifier) is reused as-is. The
- * model then appears as jevmodel/jev-latest in the registry and joins the
- * default classify chain after typesafe, which is what keeps Jev reachable
- * from behind the Typesafe region block (HTTP 451 / blackholed connections).
+ * self-contained transport (lib.ts) only needs the base URL and the key. The
+ * model then appears as jevmodel/jev-latest in the registry and leads the
+ * default classify chain, which is what keeps Jev reachable from behind the
+ * Typesafe region block (HTTP 451 / blackholed connections).
  */
 function registerJevmodelProvider(pi: ExtensionAPI): void {
 	if (!process.env.JEVMODEL_API_KEY) return;
@@ -451,7 +493,7 @@ function registerJevmodelProvider(pi: ExtensionAPI): void {
 		baseUrl,
 		apiKey: "$JEVMODEL_API_KEY",
 		api: "typesafe-system-one",
-		classifiers: { "typesafe-system-one": typesafeSystemOneApi() },
+		classifiers: { "typesafe-system-one": jevmodelClassifier },
 		models: [
 			{
 				type: "classifier",
